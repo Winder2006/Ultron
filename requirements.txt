@@ -1,0 +1,48 @@
+# === Existing dependencies ===
+httpx==0.28.1
+pydantic==2.11.9
+PyYAML==6.0.3
+numpy==2.3.3
+soundfile==0.13.1
+requests==2.32.3
+sounddevice==0.5.0
+webrtcvad==2.0.10
+
+# STT
+faster-whisper>=1.0.0           # keep — offline fallback
+deepgram-sdk>=3.0.0             # Phase 1 — streaming STT
+
+# Wake word + VAD
+openwakeword>=0.6.0             # Phase 2 — wake word detection
+# silero-vad via torch.hub      # Phase 1 — no separate pip package needed
+
+# TTS
+kokoro>=0.9.4                   # current TTS engine
+# DEPRECATED after Phase 3 — chatterbox-tts replaces kokoro
+# chatterbox-tts               # Phase 3 — Chatterbox Turbo (uncomment when ready)
+
+# LLM routing
+anthropic>=0.25.0               # existing — Claude API
+litellm>=1.0.0                  # Phase 5 — unified LLM interface
+groq>=0.4.0                     # Phase 5 — Groq Llama 3.3 70B
+
+# Memory
+psycopg2-binary>=2.9.0          # Phase 4 — PostgreSQL
+
+# Developer ergonomics
+watchdog>=4.0.0                 # A1 — auto-reindex codebase RAG on file save
+pgvector>=0.2.0                 # Phase 4 — vector similarity search
+sqlalchemy>=2.0.0               # Phase 4 — ORM
+mem0ai>=0.1.0                   # Phase 4 — memory extraction
+
+# API server
+fastapi>=0.110.0                # Phase 6
+uvicorn[standard]>=0.29.0       # Phase 6
+websockets>=12.0                # Phase 6
+python-multipart>=0.0.9         # Phase 6
+
+# Message bus
+paho-mqtt>=2.0.0                # Phase 6 — vision events
+
+# Utilities
+python-dotenv>=1.0.0

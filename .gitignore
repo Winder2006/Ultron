@@ -1,0 +1,88 @@
+# ── Secrets ──
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── IDE / editor ──
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Logs ──
+logs/
+*.log
+
+# ── Build artifacts ──
+out/
+dist/
+build/
+*.egg-info/
+
+# ── Node / dashboard ──
+node_modules/
+dashboard/dist/
+dashboard/.vite/
+
+# ── Large binaries & models ──
+# Voice models, TTS binaries, ONNX weights. These are either
+# upstream-distributable or too large for git.
+bin/
+voices/
+*.onnx
+*.onnx.json
+*.pt
+*.pth
+*.bin
+*.gguf
+*.safetensors
+
+# EXCEPT the dashboard's wake-word + ORT assets — those ARE part of
+# the app's build output and need to ship with the repo.
+!dashboard/public/models/
+!dashboard/public/models/**
+!dashboard/public/ort/
+!dashboard/public/ort/**
+
+# Third-party sub-project (has its own .git + 641MB of node_modules)
+edex-ui/
+
+# ── Runtime artifacts ──
+ultron_clips/
+out/audio/
+assistant/__pycache__/
+assistant/memory/**/*.db
+assistant/memory/**/*.sqlite
+assistant/memory/**/*.sqlite3
+
+# ── TTS voice profiles (user-specific WAVs) ──
+tts/voice_profiles/*.wav
+tts/voice_profiles/*.mp3
+
+# NOTE: dashboard/public/models/ and dashboard/public/ort/ are COMMITTED
+# — they're the wake-word ONNX models + ONNX Runtime wasm files the
+# browser app needs at runtime (~41MB total, under GitHub's limit).
+
+# ── Background task artifacts from claude code ──
+.claude/
+

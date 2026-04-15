@@ -1,0 +1,9 @@
+faiss-cpu
+onnxruntime
+numpy
+pydantic
+fastapi
+uvicorn
+python-frontmatter
+yahooquery
+

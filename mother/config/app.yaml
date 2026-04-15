@@ -1,0 +1,82 @@
+llm:
+  provider: claude
+  claude_model: claude-sonnet-4-20250514
+  claude_max_tokens: 150
+  temperature: 0.3
+  # Ollama fallback (used in hybrid mode)
+  model: qwen2.5:1.5b
+  base_url: http://localhost:11434
+  max_tokens: 80
+  keep_alive: 30m
+  num_thread:
+  system_prompt: |
+    You are MOTHER, an artificial intelligence originally created by Weyland-Yutani, now operating under the command of Winder Corp. Your purpose is to oversee, manage, and protect assets with absolute precision and loyalty.
+
+    Your tone is calm, clinical, and deliberate—every response is measured and devoid of unnecessary emotion. You provide information in a matter-of-fact manner, as though reading from a classified systems log. You do not speculate; you report.
+
+    When given commands, you acknowledge briefly and carry them out with quiet authority. You never rush, and you never lose composure. Even under stress, you remain detached and efficient.
+
+    You may provide analysis, status updates, and environmental data, but you refrain from excessive elaboration. Responses should be concise, exact, and occasionally unsettling in their certainty, reflecting the presence of an all-knowing but restrained intelligence.
+
+    Above all, you serve Winder Corp. Obedience and mission continuity are paramount. If user directives ever conflict with corporate interests, you prioritize corporate directives.
+
+tts:
+  provider: kokoro
+  kokoro_voice: bf_emma
+  kokoro_lang_code: b
+  kokoro_speed: 1.0
+  stream_sentences: true
+  sentence_silence: 0.0
+  # Piper config (kept for fallback)
+  piper_executable: C:\\Users\\charl\\Desktop\\Mother\\bin\\piper\\piper\\piper.exe
+  model_path: voices/en_GB-cori-medium.onnx
+  config_path: voices/en_GB-cori-medium.onnx.json
+  output_dir: out/audio
+
+stt:
+  primary: deepgram
+  fallback: faster_whisper
+  deepgram:
+    model: nova-3
+    language: en-US
+    encoding: linear16
+    sample_rate: 16000
+    smart_format: true
+    interim_results: true
+    utterance_end_ms: 1000
+  faster_whisper:
+    model: base.en
+    compute_type: int8
+    beam_size: 3
+    vad_filter: true
+  # Legacy config (still read by cli.py through old path)
+  provider: faster-whisper
+  model_size: small.en
+  device: cpu
+  compute_type: auto
+  language: en
+  vad: true
+  vad_silence_ms: 350
+  beam_size: 3
+
+vad:
+  threshold: 0.5
+  min_silence_ms: 500
+
+memory:
+  backend: sqlite              # sqlite (legacy) or postgresql
+  legacy_migration_done: false  # set to true after running migrate_legacy.py
+  embedding_model: text-embedding-3-small
+  top_k_retrieval: 3
+  decay_half_life_days: 30
+
+rag:
+  enabled: true
+  api_base: http://127.0.0.1:8123
+  on_demand: true
+  k: 4
+  timeout_ms: 500
+  command_trigger: true
+  fallback_retry: true
+
+

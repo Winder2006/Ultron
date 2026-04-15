@@ -1,0 +1,12 @@
+{
+  "preferred_name": "Win",
+  "timezone": "America/Chicago",
+  "wake_word": "mother",
+  "night_temp": 67,
+  "evening_lighting": "blue",
+  "tts_voice": "en_GB_cori_high",
+  "episodic": [
+    {"text": "Prefers blue lights after 22:30", "tags": ["lighting","habit"], "confidence": 0.95}
+  ]
+}
+
