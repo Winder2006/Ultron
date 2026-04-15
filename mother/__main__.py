@@ -10,10 +10,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 
 
 def main():
+    # Honour the PaaS-injected $PORT env var (Railway, Heroku, Render,
+    # Fly all set this) — if present, it takes precedence over the
+    # argparse default so the container binds to whatever the platform
+    # expects. Explicit --port still wins if the user passes it.
+    default_port = int(os.environ.get("PORT", "8300"))
+    default_host = os.environ.get("HOST", "0.0.0.0")
+
     parser = argparse.ArgumentParser(
         prog="mother",
         description="MU/TH/UR 6000 AI Assistant",
@@ -22,8 +30,8 @@ def main():
     parser.add_argument("--ptt", action="store_true", help="Push-to-talk mode (Enter key)")
     parser.add_argument("--prompt", default=None, help="Single text prompt (no mic)")
     parser.add_argument("--server", action="store_true", help="Start FastAPI server")
-    parser.add_argument("--host", default="0.0.0.0", help="Server bind address")
-    parser.add_argument("--port", type=int, default=8300, help="Server port")
+    parser.add_argument("--host", default=default_host, help="Server bind address")
+    parser.add_argument("--port", type=int, default=default_port, help="Server port")
     args = parser.parse_args()
 
     # Default to PTT if no mode specified

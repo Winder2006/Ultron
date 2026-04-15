@@ -201,11 +201,18 @@ app = create_app()
 # ── CLI entry point ──────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import os
     import uvicorn
 
+    # PaaS platforms (Railway, Heroku, Render, Fly.io) inject $PORT —
+    # honour it so the health check can reach the container. Explicit
+    # --port still wins for local dev.
+    default_port = int(os.environ.get("PORT", "8300"))
+    default_host = os.environ.get("HOST", "0.0.0.0")
+
     parser = argparse.ArgumentParser(description="MOTHER API server")
-    parser.add_argument("--host", default="0.0.0.0", help="Bind address")
-    parser.add_argument("--port", type=int, default=8300, help="Port (default 8300)")
+    parser.add_argument("--host", default=default_host, help="Bind address")
+    parser.add_argument("--port", type=int, default=default_port, help="Port (default 8300 / $PORT)")
     parser.add_argument("--reload", action="store_true", help="Auto-reload on code changes")
     args = parser.parse_args()
 

@@ -114,8 +114,14 @@ tts:
   kokoro_speed: 1.0
   stream_sentences: true
   sentence_silence: 0.0
-  # Piper config (kept for fallback)
-  piper_executable: C:\\Users\\charl\\Desktop\\Mother\\bin\\piper\\piper\\piper.exe
+  # Piper config (kept as fallback if Deepgram is unreachable).
+  # Use a relative path so the same config works on Windows (local
+  # dev), Linux containers (Railway / docker), and macOS. The
+  # `.exe` suffix is Windows-only — on Linux, piper's binary is
+  # just `piper`. The TTS engine skips Piper entirely if the path
+  # doesn't resolve, so hosted deployments without piper-on-disk
+  # just run on Deepgram.
+  piper_executable: ./bin/piper/piper/piper
   model_path: voices/en_GB-cori-medium.onnx
   config_path: voices/en_GB-cori-medium.onnx.json
   output_dir: out/audio
