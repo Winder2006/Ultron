@@ -75,6 +75,15 @@ assistant/memory/**/*.db
 assistant/memory/**/*.sqlite
 assistant/memory/**/*.sqlite3
 
+# ── Personal runtime memory data (never publish) ──
+# Embedded conversation history, pickled REPL namespaces, FAISS
+# indexes. These contain private conversation content. (Files under
+# assistant/memory/users/ that were tracked before this rule stay
+# tracked until explicitly `git rm --cached`-ed.)
+assistant/memory/users/**/long_memory.index
+assistant/memory/users/**/long_memory_meta.jsonl
+assistant/memory/users/**/repl_namespace.pkl
+
 # ── TTS voice profiles (user-specific WAVs) ──
 tts/voice_profiles/*.wav
 tts/voice_profiles/*.mp3

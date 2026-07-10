@@ -68,6 +68,20 @@ TIER1_PATTERNS = [
     ),
 ]
 
+# Words that signal the query needs real computation (execute_python /
+# calculate). Tier1 (Cerebras Llama 8B) gets NO tools — so a 2-3 word
+# query like "factorial of twenty" or "hash hello" that falls into the
+# short-query tier1 shortcut would be answered from the model's head
+# instead of running code. Any of these keywords forces at least tier2
+# regardless of word count.
+COMPUTE_HINTS = re.compile(
+    r"\b(hash|sha-?\d*|md5|factorial|fibonacci|prime|primes|plot|graph|"
+    r"histogram|median|mean|average|std|variance|sort|shuffle|random|"
+    r"compute|simulate|csv|dataframe|regex|encode|decode|base64|"
+    r"uuid|permutation|combination|digits)\b",
+    re.I,
+)
+
 
 def classify_complexity(query: str, intent: str = "GENERAL") -> Tier:
     """Classify query complexity into a routing tier.
@@ -87,7 +101,11 @@ def classify_complexity(query: str, intent: str = "GENERAL") -> Tier:
     # Short greetings and explicit tier1 patterns short-circuit
     # before any tier3 trigger can grab them. Fixes the case where
     # a short or trivial query accidentally contains a tier3 keyword.
-    if word_count <= 5:
+    # Compute-flavored queries are exempt from the shortcut: tier1
+    # has no tools, so routing "factorial of twenty" there means the
+    # answer gets recited instead of executed.
+    needs_compute = bool(COMPUTE_HINTS.search(q_lower))
+    if word_count <= 5 and not needs_compute:
         for pat in TIER1_PATTERNS:
             if pat.search(q):
                 return "tier1"
@@ -100,9 +118,24 @@ def classify_complexity(query: str, intent: str = "GENERAL") -> Tier:
     if word_count > 50:
         return "tier3"
 
-    # Explicit reasoning/code triggers
-    for trigger in TIER3_TRIGGERS:
-        if trigger in q_lower:
+    # Explicit reasoning/code triggers — match on word boundaries so
+    # ambiguous substrings ("function" appearing inside "functions"
+    # in a plot prompt) don't escalate. We also require the query to
+    # be at least 8 words for trigger matching: short queries like
+    # "translate hello" don't need Sonnet, Haiku handles them fine.
+    if word_count >= 8:
+        # \b matches anchor on word boundaries. We compile a single
+        # alternation pattern for speed instead of looping.
+        pattern_parts = []
+        for trig in TIER3_TRIGGERS:
+            # Multi-word triggers ("write a", "step by step") still match
+            # via plain substring — the boundary issue only bites single
+            # words that are also substrings of common words.
+            if " " in trig:
+                pattern_parts.append(re.escape(trig))
+            else:
+                pattern_parts.append(r"\b" + re.escape(trig) + r"\b")
+        if re.search("|".join(pattern_parts), q_lower):
             return "tier3"
 
     # Multiple sentence-questions stacked → probably compound reasoning
@@ -115,8 +148,9 @@ def classify_complexity(query: str, intent: str = "GENERAL") -> Tier:
     if question_count >= 2:
         return "tier3"
 
-    # Code indicators
-    if any(kw in q_lower for kw in ("```", "def ", "function ", "class ", "import ", "var ", "const ")):
+    # Code indicators — these specifically include syntax punctuation
+    # so they only match when the user is literally pasting code.
+    if any(kw in q_lower for kw in ("```", "def ", "function(", "class ", "import ", "var ", "const ")):
         return "tier3"
 
     # --- Tier 2: default ---

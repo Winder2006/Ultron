@@ -156,8 +156,12 @@ class StreamingSTT:
         self._whisper = FasterWhisperSTT(self._wh_cfg)
         logger.info("[STT] Faster-Whisper loaded (fallback ready)")
 
-        # Check Deepgram connectivity
-        self._deepgram_available = self._check_deepgram_available()
+        # Check Deepgram connectivity. Wrapped in to_thread so the
+        # 2-second blocking socket connect can't freeze the asyncio
+        # loop during server startup.
+        self._deepgram_available = await asyncio.to_thread(
+            self._check_deepgram_available
+        )
         if self._deepgram_available:
             logger.info("[STT] Deepgram API reachable — using as primary")
         else:
@@ -318,6 +322,14 @@ class StreamingSTT:
                     interim_results=bool_to_str(cfg.interim_results),
                     utterance_end_ms=cfg.utterance_end_ms,
                     punctuate="true",
+                    # endpointing in ms — how much silence Deepgram's
+                    # VAD waits before flipping speech_final=true. The
+                    # default is 10ms which is too aggressive (cuts off
+                    # mid-pause). 300ms is a comfortable middle ground:
+                    # late enough that Deepgram doesn't fire on natural
+                    # speech pauses, early enough that we don't sit
+                    # waiting forever after the user stops.
+                    endpointing=300,
                 ) as socket:
                     import threading
                     audio_done = threading.Event()
@@ -351,10 +363,27 @@ class StreamingSTT:
                         target=_audio_pump, daemon=True, name="dg-audio-pump",
                     )
                     pump_thread.start()
-                    socket.start_listening()
+                    # IMPORTANT: do NOT call socket.start_listening() —
+                    # in Deepgram SDK 6.x it's a BLOCKING event-loop
+                    # that drains every message via internal callbacks,
+                    # leaving nothing for recv() to consume. Calling
+                    # both makes recv() block forever (no transcripts
+                    # ever arrive). Use recv() polling exclusively.
 
                     # Drain events until the socket closes or we get a
                     # final + audio_done.
+                    #
+                    # Deepgram emits two related flags on Results events:
+                    #   • is_final     — transcript is fully refined
+                    #                    (~600-1000ms after speech ends)
+                    #   • speech_final — VAD detected end-of-utterance
+                    #                    (~150-250ms earlier than is_final)
+                    # We treat speech_final as good-enough-to-commit so we
+                    # don't pay the extra refinement window. The transcript
+                    # at speech_final is essentially identical to the
+                    # eventual is_final on short utterances; on longer
+                    # ones the tiny refinement (punctuation tweaks) isn't
+                    # worth 200ms of latency.
                     while True:
                         try:
                             event = socket.recv()
@@ -371,31 +400,44 @@ class StreamingSTT:
                             except Exception:
                                 transcript = ""
                             is_final = bool(getattr(event, "is_final", False))
+                            speech_final = bool(getattr(event, "speech_final", False))
+                            # Either flag means "this is committable text"
+                            commit = is_final or speech_final
                             if transcript:
                                 asyncio.run_coroutine_threadsafe(
-                                    result_q.put((transcript, is_final, False)),
+                                    result_q.put((transcript, commit, False)),
                                     loop,
                                 ).result()
-                            if is_final and audio_done.is_set():
+                            # speech_final fires the moment Deepgram's VAD
+                            # decides the user stopped — break immediately
+                            # without waiting for the slower is_final
+                            # refinement pass.
+                            if commit and audio_done.is_set():
                                 break
 
                     pump_thread.join(timeout=0.5)
             except Exception as e:
-                # Re-raised on the async side via the exception sentinel
+                # Signal abort to the async side. The error sentinel
+                # MUST land before the close sentinel — otherwise the
+                # consumer breaks on done=True without ever seeing the
+                # "__error__" marker, and the REST fallback never fires.
+                # We use .result() to enforce ordering: this call won't
+                # return until the put completes on the loop thread.
                 logger.warning("[STT] WS streaming error: %s", e)
-                asyncio.run_coroutine_threadsafe(
-                    result_q.put(("", False, True)), loop,
-                ).result()
-                # Re-raise via a marker so the outer caller knows it failed.
-                # Use a None+exception combo to signal abort.
-                asyncio.run_coroutine_threadsafe(
-                    result_q.put(("__error__", False, True)), loop,
-                )
-                return
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        result_q.put(("__error__", False, False)), loop,
+                    ).result()
+                except Exception:
+                    pass
             finally:
-                asyncio.run_coroutine_threadsafe(
-                    result_q.put(("", False, True)), loop,
-                )
+                # Single close sentinel, regardless of success/error path.
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        result_q.put(("", False, True)), loop,
+                    )
+                except Exception:
+                    pass
 
         import threading
         runner = threading.Thread(target=_runner, daemon=True, name="dg-stt-runner")
@@ -506,15 +548,31 @@ class StreamingSTT:
     async def transcribe_audio(self, audio: np.ndarray, sample_rate: int = 16000) -> str:
         """Convenience: transcribe a complete audio array.
 
-        Uses Deepgram if available, else Whisper. Returns final text.
+        BATCH path. Skips the WebSocket entirely and goes straight to
+        Deepgram REST (or Whisper if Deepgram is unavailable). The
+        WebSocket is only useful when audio is being streamed in real
+        time; for a buffered audio array there's no streaming benefit
+        and the WS handshake adds 200-500ms over plain REST. Voice
+        route uses this as the fallback when its live WS attempt
+        didn't deliver a final transcript.
         """
+        if self._deepgram_available and self._dg_api_key:
+            try:
+                final_text = ""
+                async for text, is_final in self._deepgram_rest([audio]):
+                    if is_final and text:
+                        final_text = text
+                if final_text:
+                    return final_text
+            except Exception as e:
+                logger.warning("[STT] REST batch failed: %s — using Whisper", e)
+
+        # Fallback: Whisper local
         queue: asyncio.Queue = asyncio.Queue()
-        # Feed all audio as one chunk then sentinel
         await queue.put(audio)
         await queue.put(None)
-
         final_text = ""
-        async for text, is_final in self.stream(queue):
+        async for text, is_final in self._whisper_stream(queue):
             if is_final:
                 final_text = text
         return final_text

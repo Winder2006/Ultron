@@ -206,39 +206,101 @@ class TieredLLMDriver(LLMDriver):
         max_tokens: Optional[int] = None,
         extra: Optional[Dict] = None,
         tools: Optional[List[Dict]] = None,
+        tier: Optional[str] = None,
+    ) -> Iterator[str]:
+        # Tier may be passed explicitly (preferred — atomic with the
+        # call) or inherited from set_tier() (legacy). Reading it as a
+        # call argument eliminates the race where two concurrent
+        # WebSocket sessions would step on each other's _current_tier.
+        if tier is None:
+            tier = self._current_tier
+        if tier not in self._models:
+            raise ValueError(f"Unknown tier: {tier}")
+        yield from self._stream_attempt(
+            messages, temperature, max_tokens, extra, tools,
+            tier=tier, attempted=set(),
+        )
+
+    def _stream_attempt(
+        self,
+        messages: List[ChatMessage],
+        temperature: float,
+        max_tokens: Optional[int],
+        extra: Optional[Dict],
+        tools: Optional[List[Dict]],
+        *,
+        tier: str,
+        attempted: set,
     ) -> Iterator[str]:
         import litellm
 
-        tier = self._current_tier
+        attempted.add(tier)
         model = self._models[tier]
         tok = max_tokens or self._max_tokens.get(tier, 150)
+        # When tools are attached, the tool-call arguments (e.g. the
+        # entire Python code string for execute_python) stream as
+        # OUTPUT tokens and count against max_tokens. A speech-sized
+        # budget (80-160) truncates any non-trivial code mid-JSON;
+        # the stream then finishes with reason "length", the tool call
+        # is unusable, and the model appears to "refuse" to execute.
+        # Floor the budget when tools are in play — the persona prompt
+        # still keeps plain speech short.
+        if tools and tier in ("tier2", "tier3"):
+            tok = max(tok, 1024)
 
         # Build messages in OpenAI format. For Anthropic tiers, mark
-        # the system message as cacheable — Claude's prompt caching
-        # skips ~90% of the re-processing cost on turn 2+ when the
-        # system prompt is stable, which saves 150-400ms of TTFT on
-        # every non-first turn. The cache lives for 5 minutes by
-        # default; subsequent conversational turns keep hitting it.
+        # the FIRST system message as cacheable — Claude's prompt
+        # caching skips ~90% of the re-processing cost on turn 2+
+        # when the system prompt is stable, saving 150-400ms TTFT.
+        #
+        # When multiple consecutive system messages are passed in
+        # (e.g. static persona + dynamic per-turn context), we merge
+        # them into one multi-block system payload. cache_control
+        # goes on the FIRST block only — that's the static persona +
+        # tools. The remaining blocks (dynamic context like RAG hits,
+        # prosody, memory) are NOT cached, so they're free to change
+        # per turn without busting the cache for the static block.
+        # The cache lives 5 minutes by default; subsequent turns
+        # within that window keep hitting it.
         is_anthropic = model.startswith("anthropic/") or "claude" in model.lower()
         api_messages = []
-        for i, m in enumerate(messages):
+        i = 0
+        while i < len(messages):
+            m = messages[i]
             role = m.role
             if role == "tool":
                 role = "user"
-            if is_anthropic and role == "system" and i == 0:
-                # Structured content array with cache_control so Claude
-                # caches the system prompt. LiteLLM passes this through
-                # to the Anthropic API unchanged.
+            if is_anthropic and role == "system":
+                # Collect ALL consecutive system messages and merge
+                # into a multi-block content array. First block gets
+                # cache_control; the rest don't.
+                sys_blocks = []
+                first_block = True
+                while i < len(messages) and messages[i].role == "system":
+                    block = {"type": "text", "text": messages[i].content}
+                    if first_block:
+                        block["cache_control"] = {"type": "ephemeral"}
+                        first_block = False
+                    sys_blocks.append(block)
+                    i += 1
                 api_messages.append({
                     "role": "system",
-                    "content": [{
-                        "type": "text",
-                        "text": m.content,
-                        "cache_control": {"type": "ephemeral"},
-                    }],
+                    "content": sys_blocks,
                 })
-            else:
-                api_messages.append({"role": role, "content": m.content})
+                continue
+            # Non-Anthropic: collapse consecutive system messages into
+            # a single string-content message (no cache_control).
+            if role == "system":
+                # Merge all adjacent system messages into one string.
+                merged = m.content
+                i += 1
+                while i < len(messages) and messages[i].role == "system":
+                    merged += "\n\n" + messages[i].content
+                    i += 1
+                api_messages.append({"role": "system", "content": merged})
+                continue
+            api_messages.append({"role": role, "content": m.content})
+            i += 1
 
         # Ensure first message is from user
         if api_messages and api_messages[0]["role"] == "system" and len(api_messages) > 1:
@@ -264,11 +326,43 @@ class TieredLLMDriver(LLMDriver):
                 elif "type" in t:
                     oai_tools.append(t)
             if oai_tools:
+                # ── Anthropic tool-schema caching ──
+                # Tool definitions are byte-stable across turns
+                # (TOOLS_SCHEMA is a module-level constant), so they
+                # can be cached. Anthropic's prompt cache works at the
+                # block level: marking the LAST tool with cache_control
+                # caches the entire tool list AND the system prompt
+                # before it. Without this we re-process ~10-15 KB of
+                # tool definitions on every turn — adds 200-400ms TTFT.
+                if is_anthropic:
+                    last = dict(oai_tools[-1])
+                    last["cache_control"] = {"type": "ephemeral"}
+                    oai_tools = oai_tools[:-1] + [last]
                 kwargs["tools"] = oai_tools
 
         try:
             response = litellm.completion(**kwargs)
             tool_call_buffer: Dict[int, Dict] = {}
+            last_finish = None
+
+            def _emit_tool_sentinels():
+                for _idx, tc_data in tool_call_buffer.items():
+                    try:
+                        args = json.loads(tc_data["arguments"]) if tc_data["arguments"] else {}
+                    except json.JSONDecodeError:
+                        args = {}
+                    sentinel = {
+                        "message": {
+                            "tool_calls": [{
+                                "function": {
+                                    "name": tc_data["name"],
+                                    "arguments": args,
+                                }
+                            }]
+                        },
+                        "done": True,
+                    }
+                    yield f"__TOOL_CALL__:{json.dumps(sentinel)}"
 
             for chunk in response:
                 delta = chunk.choices[0].delta if chunk.choices else None
@@ -296,70 +390,62 @@ class TieredLLMDriver(LLMDriver):
 
                 # Check if stream is done
                 finish = chunk.choices[0].finish_reason if chunk.choices else None
+                if finish:
+                    last_finish = finish
                 if finish == "tool_calls" and tool_call_buffer:
-                    # Emit tool calls as __TOOL_CALL__ sentinel for backward compat
-                    for idx, tc_data in tool_call_buffer.items():
-                        try:
-                            args = json.loads(tc_data["arguments"]) if tc_data["arguments"] else {}
-                        except json.JSONDecodeError:
-                            args = {}
-                        sentinel = {
-                            "message": {
-                                "tool_calls": [{
-                                    "function": {
-                                        "name": tc_data["name"],
-                                        "arguments": args,
-                                    }
-                                }]
-                            },
-                            "done": True,
-                        }
-                        yield f"__TOOL_CALL__:{json.dumps(sentinel)}"
+                    yield from _emit_tool_sentinels()
                     return
 
+            # Stream ended without a "tool_calls" finish reason but a
+            # tool call WAS buffered. Two observed causes: providers
+            # that report finish_reason "stop" alongside tool_calls,
+            # and "length" truncation. Dropping the buffer here made
+            # the caller see an empty stream, retry WITHOUT tools, and
+            # answer from memory instead of executing. Emit what we
+            # have — a complete-but-mislabeled call runs normally, and
+            # a truncated one surfaces as a visible tool error instead
+            # of a silent recitation.
+            if tool_call_buffer:
+                import logging
+                logging.getLogger("mother.llm").warning(
+                    "[LLM] flushing %d buffered tool call(s) despite "
+                    "finish_reason=%r (model=%s)",
+                    len(tool_call_buffer), last_finish, model,
+                )
+                yield from _emit_tool_sentinels()
+
         except Exception as e:
-            # Bounded fallback to a lower tier. The previous version
-            # recursed into stream_chat, which meant a misconfigured
-            # tier1 could loop (tier3 fails → tier2 fails → tier1 fails
-            # → tier1 still in _models → recurse forever). We track
-            # attempts per-call via a thread-local set so the recursion
-            # can visit each tier at most once before raising.
+            # Bounded fallback to a lower tier. `attempted` is a local
+            # set that the call chain threads through, so two concurrent
+            # WS sessions can't corrupt each other's visited list (the
+            # earlier instance-attribute version had a real race). Each
+            # tier is visited at most once before we re-raise.
             import logging
             _log = logging.getLogger("mother.llm")
-            attempted = getattr(self, "_fallback_attempts", None)
-            is_root = attempted is None
-            if is_root:
-                attempted = {tier}
-                self._fallback_attempts = attempted
-            try:
-                fallback_order = ["tier3", "tier2", "tier1"]
-                current_idx = fallback_order.index(tier) if tier in fallback_order else -1
-                for fb_tier in fallback_order[current_idx + 1:]:
-                    if fb_tier in attempted:
-                        continue
-                    if fb_tier not in self._models:
-                        continue
-                    attempted.add(fb_tier)
-                    _log.warning(
-                        "[LLM] %s failed (%s) — falling back to %s (%s)",
-                        model, e, fb_tier, self._models[fb_tier],
+            fallback_order = ["tier3", "tier2", "tier1"]
+            current_idx = fallback_order.index(tier) if tier in fallback_order else -1
+            for fb_tier in fallback_order[current_idx + 1:]:
+                if fb_tier in attempted:
+                    continue
+                if fb_tier not in self._models:
+                    continue
+                _log.warning(
+                    "[LLM] %s failed (%s) — falling back to %s (%s)",
+                    model, e, fb_tier, self._models[fb_tier],
+                )
+                try:
+                    yield from self._stream_attempt(
+                        messages, temperature, max_tokens, extra, tools,
+                        tier=fb_tier, attempted=attempted,
                     )
-                    self._current_tier = fb_tier
-                    try:
-                        yield from self.stream_chat(
-                            messages, temperature, max_tokens, extra, tools
-                        )
-                        return
-                    except Exception as fe:
-                        _log.warning(
-                            "[LLM] fallback tier %s also failed: %s", fb_tier, fe,
-                        )
-                        continue
-                _log.error("[LLM] all tiers exhausted — re-raising original: %s", e)
-                raise
-            finally:
-                if is_root:
-                    self._fallback_attempts = None
+                    return
+                except Exception as fe:
+                    _log.warning(
+                        "[LLM] fallback tier %s also failed: %s", fb_tier, fe,
+                    )
+                    continue
+            _log.error("[LLM] all tiers exhausted — re-raising original: %s", e)
+            raise
 
 
 class OllamaLLMDriver(LLMDriver):

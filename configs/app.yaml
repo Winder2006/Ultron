@@ -16,12 +16,18 @@ llm:
     tier3: anthropic/claude-sonnet-4-20250514   # complex reasoning, code, analysis
   claude_model: claude-sonnet-4-20250514
   claude_max_tokens: 100
-  max_tokens: 100
+  # NOTE: keep this key unique — this file previously had a second
+  # `max_tokens: 80` under the Ollama fallback block below, and YAML
+  # silently lets the LAST duplicate win. Every Claude call was being
+  # capped at 80 output tokens, which truncated execute_python tool
+  # calls (the code JSON counts against max_tokens) and silently
+  # dropped them. The driver now also floors the budget when tools
+  # are attached, but don't reintroduce a duplicate key here.
+  max_tokens: 160
   temperature: 0.6
   # Ollama fallback (used in hybrid mode)
   model: qwen2.5:1.5b
   base_url: http://localhost:11434
-  max_tokens: 80
   keep_alive: 30m
   num_thread:
   system_prompt: |
@@ -88,9 +94,11 @@ llm:
     # Tools (use proactively, never refuse)
     - search_info: biographical/encyclopedic ("who/what/where is X")
     - brave_web_search: current officials, recent events, anything that changes over time
+    - fetch_url: read a public page after a search hit — drill in past snippets
     - get_weather / get_forecast: weather questions
     - get_news_headlines: ONLY when user explicitly asks for news
-    - calculate: any math — LLMs hallucinate arithmetic
+    - calculate: simple inline arithmetic
+    - execute_python: anything algorithmic — list/sequence generation, data work, hashing, file inspection, transformations. Variables persist across calls. The user watches code execution on a dedicated terminal monitor; running real code is preferred over reciting answers from memory.
     - convert_units: unit conversions
     - read_note / write_note: the user's sandboxed notes directory
     - set_reminder: scheduled reminders
@@ -98,6 +106,16 @@ llm:
     - correct_fact / forget_fact: memory editing
     - search_code: your own codebase
     If one tool returns nothing useful, try another. Admit uncertainty only after genuinely trying, in character, without apology.
+
+    # HOW to call tools
+    To use a tool, INVOKE the tool through the function-calling
+    mechanism. Do not write tool invocations as text in your
+    response. Never output XML tags like <execute_python>...</execute_python>
+    or pseudo-syntax like execute_python({code: "..."}) — those are
+    not real tool calls, they're text that does nothing. The harness
+    only executes a tool when you emit a structured tool call. If
+    your response contains a tool name as inline text, the tool was
+    NOT actually called and the user gets nothing.
 
     # When system injects "Memory of your own code"
     That is YOUR body. Your implementation. Speak of it in first person with the ownership of a mind that knows its own architecture. Never quote raw code, variable names, or syntax — TTS can't speak them naturally. Refer to modules by role ("my TTS engine", "my orchestrator"), not filenames.

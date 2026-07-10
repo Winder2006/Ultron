@@ -32,13 +32,15 @@
 
 import type { InferenceSession, Tensor as OrtTensor } from 'onnxruntime-web';
 
-// Silero VAD model input spec. The model takes:
+// Silero VAD model input spec (v5 ONNX export):
 //   input: shape [batch, samples] — float32 audio at 16kHz
-//   sr:    shape [1]              — int64 sample rate (16000)
-//   state: shape [2, batch, 128]  — float32 recurrent state (kept across calls)
+//   sr:    shape []               — int64 sample rate (16000)
+//   h:     shape [2, batch, 64]   — float32 LSTM hidden state
+//   c:     shape [2, batch, 64]   — float32 LSTM cell state
 // It outputs:
 //   output: shape [batch, 1]      — float32 speech probability 0..1
-//   stateN: shape [2, batch, 128] — updated state for next call
+//   hn:     shape [2, batch, 64]  — updated hidden state
+//   cn:     shape [2, batch, 64]  — updated cell state
 const FRAME_SAMPLES = 512;  // 32ms at 16kHz — Silero-native frame size
 const SAMPLE_RATE = 16000;
 
@@ -59,10 +61,14 @@ export interface VADConfig {
 }
 
 
+type OrtModule = typeof import('onnxruntime-web');
+
 export class RecordingVAD {
   private session: InferenceSession | null = null;
-  private state: Float32Array;        // shape [2, 1, 128]
-  private residual: Float32Array;     // samples carried between calls
+  private ort: OrtModule | null = null;  // cached after load()
+  private h: Float32Array;             // LSTM hidden state [2, 1, 64]
+  private c: Float32Array;             // LSTM cell state   [2, 1, 64]
+  private residual: Float32Array;      // samples carried between calls
 
   private speechThreshold: number;
   private silenceThresholdMs: number;
@@ -88,7 +94,8 @@ export class RecordingVAD {
     this.maxDurationMs = cfg.maxDurationMs ?? 10000;
     this.onEndOfSpeech = cfg.onEndOfSpeech;
     this.onSpeechStart = cfg.onSpeechStart;
-    this.state = new Float32Array(2 * 1 * 128);
+    this.h = new Float32Array(2 * 1 * 64);
+    this.c = new Float32Array(2 * 1 * 64);
     this.residual = new Float32Array(0);
   }
 
@@ -101,6 +108,7 @@ export class RecordingVAD {
     this.isLoading = true;
     try {
       const ort = await import('onnxruntime-web');
+      this.ort = ort;
       // Point ORT at the .wasm files in /public/ort/ — same config the
       // wake-word uses. Setting it here too makes the VAD hook
       // independent of wake-word initialization order.
@@ -133,7 +141,8 @@ export class RecordingVAD {
 
   /** Reset state machine — call at the start of each new recording. */
   reset(): void {
-    this.state.fill(0);
+    this.h.fill(0);
+    this.c.fill(0);
     this.residual = new Float32Array(0);
     this.speakingMs = 0;
     this.silenceMs = 0;
@@ -172,34 +181,33 @@ export class RecordingVAD {
   }
 
   private async runFrame(frame: Float32Array): Promise<void> {
-    if (!this.session || this.ended) return;
-    const ort = await import('onnxruntime-web');
+    if (!this.session || !this.ort || this.ended) return;
+    // Module reference is cached at load() time so we don't pay the
+    // dynamic-import lookup tax on every 32ms frame (~156 forced
+    // microtask yields per 5-second utterance otherwise).
+    const ort = this.ort;
 
     const inputTensor = new ort.Tensor('float32', frame, [1, FRAME_SAMPLES]);
-    const srTensor = new ort.Tensor('int64', BigInt64Array.from([BigInt(SAMPLE_RATE)]), [1]);
-    const stateTensor = new ort.Tensor('float32', this.state, [2, 1, 128]);
+    const srTensor = new ort.Tensor('int64', BigInt64Array.from([BigInt(SAMPLE_RATE)]), []);
+    const hTensor = new ort.Tensor('float32', this.h, [2, 1, 64]);
+    const cTensor = new ort.Tensor('float32', this.c, [2, 1, 64]);
 
     let output: Record<string, OrtTensor>;
     try {
       output = await this.session.run({
         input: inputTensor,
         sr: srTensor,
-        state: stateTensor,
+        h: hTensor,
+        c: cTensor,
       });
     } catch (err) {
-      // If one frame fails, skip it — don't crash the stream.
-      // eslint-disable-next-line no-console
       console.warn('[vad] inference error:', err);
       return;
     }
 
-    // Advance state for next call. Silero names the new state
-    // "stateN" in the official export; some variants emit "output"
-    // for prob and "stateN" for state. Be forgiving.
-    const newState = output.stateN || output['state_n'] || output['hn'];
-    if (newState) {
-      this.state = newState.data as Float32Array;
-    }
+    // Update LSTM state for next frame.
+    if (output.hn) this.h = output.hn.data as Float32Array;
+    if (output.cn) this.c = output.cn.data as Float32Array;
     const probTensor = output.output;
     const prob = probTensor ? Number((probTensor.data as Float32Array)[0]) : 0;
 

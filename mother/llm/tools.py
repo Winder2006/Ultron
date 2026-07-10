@@ -318,7 +318,8 @@ TOOLS_SCHEMA: List[Dict] = [
                 "Wikipedia might be stale). For stable encyclopedic "
                 "facts (definitions, dead people, historical events) "
                 "prefer search_info. NEVER claim you 'lack web access' "
-                "without trying this tool first."
+                "without trying this tool first. The result includes "
+                "URLs you can pass to fetch_url to read the full page."
             ),
             "parameters": {
                 "type": "object",
@@ -326,6 +327,228 @@ TOOLS_SCHEMA: List[Dict] = [
                     "query": {"type": "string", "description": "The search query."}
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    # ─────────── K: fetch_url ───────────
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": (
+                "Fetch and read the actual text content of a public web "
+                "page. Use this AFTER brave_web_search or search_info "
+                "when the snippets aren't enough — you have a promising "
+                "URL and need the real content (a profile page, an "
+                "article, a company About page, a GitHub README, etc.). "
+                "Pages are cleaned of navigation/scripts/ads and "
+                "truncated to ~4000 characters. Only http/https public "
+                "pages — no logins, no internal hosts. Combine with "
+                "ReAct: search → pick best hit → fetch_url → answer."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Full URL to fetch (http or https).",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": (
+                            "Cap on returned text length. Default 4000. "
+                            "Bump higher (up to 8000) only when you "
+                            "explicitly need more context."
+                        ),
+                    },
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    # ─────────── L: execute_python ───────────
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_python",
+            "description": (
+                "Run Python in a persistent REPL. Variables persist "
+                "across calls — load data once, query it across many "
+                "follow-up questions. Has the project venv: pandas, "
+                "numpy, matplotlib, requests, bs4, hashlib, stdlib. "
+                "Single-expression code returns its repr; multi-"
+                "statement code runs via exec — use print() to "
+                "surface values. 8s default timeout, max 60. "
+                "Output also appears live on the user's /exec view. "
+                "\n\n"
+                "Use this tool whenever the user asks you to "
+                "generate, compute, list, run, show, plot, count, "
+                "check, transform, or analyze anything algorithmic "
+                "— even if you think you know the answer. The user "
+                "has a dedicated terminal monitor watching for code "
+                "execution; reciting a cached answer makes that "
+                "monitor stay dark and looks wrong. Triggers include: "
+                "primes, factorials, hashing, sorting, statistics on "
+                "a list, fibonacci or other sequences, file inspection, "
+                "string manipulation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Python code. Multi-line strings allowed.",
+                    },
+                    "timeout_s": {
+                        "type": "number",
+                        "description": "Hard timeout (default 8, max 60).",
+                    },
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    # ─────────── M: get_calendar_today ───────────
+    {
+        "type": "function",
+        "function": {
+            "name": "get_calendar_today",
+            "description": (
+                "Get the user's calendar events for today from iCloud. "
+                "Use when the user asks 'what's on my schedule', 'what's "
+                "today', 'what do I have today'. Returns one speakable "
+                "line summarizing the day's events."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    # ─────────── N: get_calendar_range ───────────
+    {
+        "type": "function",
+        "function": {
+            "name": "get_calendar_range",
+            "description": (
+                "Get calendar events between two dates from iCloud. "
+                "Use for 'what's on my calendar this week', 'do I have "
+                "anything Friday', etc. Dates as ISO YYYY-MM-DD."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start_date": {
+                        "type": "string",
+                        "description": "Start date inclusive, YYYY-MM-DD.",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "End date inclusive, YYYY-MM-DD.",
+                    },
+                },
+                "required": ["start_date", "end_date"],
+            },
+        },
+    },
+    # ─────────── O: search_calendar ───────────
+    {
+        "type": "function",
+        "function": {
+            "name": "search_calendar",
+            "description": (
+                "Free-text search of the user's iCloud calendar — matches "
+                "event title or location. Searches a window of -7 to +30 "
+                "days around today. Use for 'when's my next dentist "
+                "appointment', 'do I have anything with Sarah'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keyword to match against event titles and locations.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    # ─────────── P: summarize_inbox ───────────
+    {
+        "type": "function",
+        "function": {
+            "name": "summarize_inbox",
+            "description": (
+                "Summarize recent iCloud inbox — message count, unread "
+                "count, and the top 8 by sender + subject. Use for "
+                "'what's new', 'check my email', 'anything come in'. "
+                "Default window is the last 24 hours."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hours": {
+                        "type": "integer",
+                        "description": "Look-back window in hours (default 24).",
+                    },
+                    "max": {
+                        "type": "integer",
+                        "description": "Max messages to consider (default 20).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    # ─────────── Q: search_email ───────────
+    {
+        "type": "function",
+        "function": {
+            "name": "search_email",
+            "description": (
+                "Search the iCloud inbox by keyword across subject, "
+                "sender, and (best-effort) body. Returns the top matches "
+                "with each message's UID — pass that to read_email for "
+                "the full body. Use for 'did I hear back from X', "
+                "'find that email about Y'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keyword to search for.",
+                    },
+                    "max": {
+                        "type": "integer",
+                        "description": "Max results (default 10).",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    # ─────────── R: read_email ───────────
+    {
+        "type": "function",
+        "function": {
+            "name": "read_email",
+            "description": (
+                "Read the full body of one iCloud message by its UID. "
+                "Get UIDs from summarize_inbox or search_email first. "
+                "Body is HTML-stripped and capped at ~3000 chars."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "uid": {
+                        "type": "string",
+                        "description": "Message UID returned by search_email or summarize_inbox.",
+                    },
+                },
+                "required": ["uid"],
             },
         },
     },
@@ -421,6 +644,7 @@ class ToolContext:
         user_memory=None,
         current_user=None,
         add_reminder_fn: Optional[Callable] = None,
+        repl_session_key: Optional[int] = None,
     ):
         self.http = http_client
         self.rag_base = rag_base
@@ -428,6 +652,9 @@ class ToolContext:
         self.user_memory = user_memory
         self.current_user = current_user
         self.add_reminder_fn = add_reminder_fn
+        # ID of the per-WS persistent Python REPL. None falls back
+        # to a global shared REPL (fine for one-shot CLI use).
+        self.repl_session_key = repl_session_key
 
 
 # ---------------------------------------------------------------------------
@@ -616,6 +843,48 @@ def _handle_correct_fact(args: Dict, ctx: ToolContext) -> str:
     return correct_fact(args, current_user=ctx.current_user)
 
 
+def _handle_fetch_url(args: Dict, ctx: ToolContext) -> str:
+    from mother.tools.utility_tools import fetch_url
+    return fetch_url(args)
+
+
+def _handle_execute_python(args: Dict, ctx: ToolContext) -> str:
+    from mother.tools.code_exec import execute_python
+    # Session key threads the per-WS REPL through ctx; falls back to
+    # a single global REPL if none is set (test/CLI paths).
+    return execute_python(args, session_key=getattr(ctx, "repl_session_key", None))
+
+
+def _handle_get_calendar_today(args: Dict, ctx: ToolContext) -> str:
+    from mother.tools.icloud_calendar import get_calendar_today
+    return get_calendar_today(args)
+
+
+def _handle_get_calendar_range(args: Dict, ctx: ToolContext) -> str:
+    from mother.tools.icloud_calendar import get_calendar_range
+    return get_calendar_range(args)
+
+
+def _handle_search_calendar(args: Dict, ctx: ToolContext) -> str:
+    from mother.tools.icloud_calendar import search_calendar
+    return search_calendar(args)
+
+
+def _handle_summarize_inbox(args: Dict, ctx: ToolContext) -> str:
+    from mother.tools.icloud_email import summarize_inbox
+    return summarize_inbox(args)
+
+
+def _handle_search_email(args: Dict, ctx: ToolContext) -> str:
+    from mother.tools.icloud_email import search_email
+    return search_email(args)
+
+
+def _handle_read_email(args: Dict, ctx: ToolContext) -> str:
+    from mother.tools.icloud_email import read_email
+    return read_email(args)
+
+
 _HANDLERS: Dict[str, Callable[[Dict, ToolContext], str]] = {
     # Existing tools
     "get_weather":       _handle_get_weather,
@@ -637,6 +906,14 @@ _HANDLERS: Dict[str, Callable[[Dict, ToolContext], str]] = {
     "list_my_tools":      _handle_list_my_tools,
     "forget_fact":        _handle_forget_fact,
     "correct_fact":       _handle_correct_fact,
+    "fetch_url":             _handle_fetch_url,
+    "execute_python":        _handle_execute_python,
+    "get_calendar_today":    _handle_get_calendar_today,
+    "get_calendar_range":    _handle_get_calendar_range,
+    "search_calendar":       _handle_search_calendar,
+    "summarize_inbox":       _handle_summarize_inbox,
+    "search_email":          _handle_search_email,
+    "read_email":            _handle_read_email,
 }
 
 

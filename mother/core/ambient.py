@@ -73,8 +73,15 @@ class AmbientState:
             pass  # Ambient state is best-effort
 
 
+# Anchored to the repo root, NOT the process cwd — under PM2 (or any
+# launcher with a different cwd) a relative path silently reads/writes
+# a different location, so morning greetings double-fire and idle
+# backoff resets. Same anchoring memory/manager.py uses.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
 def _user_dir(user_id: str) -> Path:
-    return Path("assistant/memory/users") / user_id
+    return _REPO_ROOT / "assistant" / "memory" / "users" / user_id
 
 
 def _now_date_str() -> str:
@@ -100,8 +107,9 @@ def _is_morning_window() -> bool:
 def _build_morning_greeting(
     user_display_name: str,
     weather_summary: Optional[str],
+    calendar_summary: Optional[str] = None,
 ) -> str:
-    """Compose a morning line. Kept short (≤2 sentences) per TTS rules."""
+    """Compose a morning line. Kept short (≤3 sentences) per TTS rules."""
     # Keep it in-character: observational, slightly amused, not perky.
     # No markdown, no stage directions — the prompt rules still apply
     # when this runs through the LLM.
@@ -117,6 +125,8 @@ def _build_morning_greeting(
     line = base_forms[idx]
     if weather_summary:
         line += f" {weather_summary}"
+    if calendar_summary:
+        line += f" {calendar_summary}"
     return line
 
 
@@ -125,6 +135,7 @@ def maybe_morning_greeting(
     user_display_name: str,
     *,
     weather_summary: Optional[str] = None,
+    calendar_summary: Optional[str] = None,
 ) -> Optional[str]:
     """Return a morning greeting line if one is due today; else None.
 
@@ -141,7 +152,9 @@ def maybe_morning_greeting(
         return None
     state.last_greeting_date = today
     state.save(dirp)
-    return _build_morning_greeting(user_display_name, weather_summary)
+    return _build_morning_greeting(
+        user_display_name, weather_summary, calendar_summary,
+    )
 
 
 # ───────────────── Trigger 2: idle observation ──────────────────────

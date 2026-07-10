@@ -53,3 +53,152 @@ html, body, #root {
   0%, 100% { opacity: 1; transform: scale(1); }
   50%      { opacity: 0.55; transform: scale(0.85); }
 }
+
+/* ── /exec terminal view ───────────────────────────────────────────── */
+.exec-view {
+  position: fixed;
+  inset: 0;
+  background: #04060a;
+  color: #d4dfe6;
+  font-family: 'Fira Code', 'Cascadia Code', Consolas, monospace;
+  font-size: 13px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.exec-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 14px;
+  border-bottom: 1px solid rgba(255, 51, 68, 0.18);
+  background: rgba(255, 51, 68, 0.05);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-size: 11px;
+}
+.exec-title {
+  color: #ff3344;
+  font-weight: 600;
+}
+.exec-status {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #6e7d8c;
+}
+.exec-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  display: inline-block;
+}
+.exec-dot.on { background: #5cff8e; box-shadow: 0 0 8px rgba(92,255,142,0.5); }
+.exec-dot.off { background: #ff3344; }
+.exec-clear {
+  background: transparent;
+  color: #6e7d8c;
+  border: 1px solid rgba(255, 51, 68, 0.25);
+  padding: 4px 10px;
+  font: inherit;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 10px;
+  cursor: pointer;
+}
+.exec-clear:hover {
+  color: #ff3344;
+  border-color: #ff3344;
+}
+.exec-scroll {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 18px 22px;
+}
+.exec-empty {
+  color: #4a5868;
+  padding: 32px 8px;
+}
+.exec-empty pre {
+  margin: 0;
+  white-space: pre-wrap;
+  line-height: 1.5;
+}
+
+.exec-cell {
+  margin-bottom: 18px;
+  border-left: 2px solid rgba(255, 51, 68, 0.35);
+  padding-left: 14px;
+}
+.exec-cell.cell-timeout {
+  border-left-color: #ffaa33;
+}
+.exec-cell-header {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  font-size: 11px;
+  color: #6e7d8c;
+  margin-bottom: 4px;
+}
+.exec-prompt {
+  color: #5e9bff;
+  font-weight: 600;
+}
+.exec-stamp {
+  letter-spacing: 0.06em;
+}
+.exec-code {
+  margin: 0 0 6px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #d4dfe6;
+  background: rgba(255, 255, 255, 0.02);
+  padding: 8px 10px;
+  border-radius: 2px;
+  border: 1px solid rgba(255, 255, 255, 0.04);
+  line-height: 1.55;
+}
+.exec-value, .exec-stdout, .exec-stderr {
+  margin: 6px 0 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding-left: 4px;
+  line-height: 1.5;
+}
+.exec-out-tag {
+  color: #ff3344;
+  font-weight: 600;
+}
+.exec-value { color: #d4dfe6; }
+.exec-stdout { color: #9bbfe0; }
+.exec-stderr { color: #ff7788; }
+
+.exec-images {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.exec-figure {
+  margin: 0;
+  background: #0a0e14;
+  border: 1px solid rgba(255, 51, 68, 0.18);
+  padding: 8px;
+  border-radius: 2px;
+  display: inline-block;
+  align-self: flex-start;
+  max-width: 100%;
+}
+.exec-figure img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  background: white;
+}
+.exec-figure figcaption {
+  margin-top: 6px;
+  font-size: 10px;
+  color: #6e7d8c;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}

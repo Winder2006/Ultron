@@ -29,8 +29,13 @@ except ImportError:
     logger.warning("Could not import embed_texts - semantic search disabled")
     embed_texts = None
 
-# Paths
-MEMORY_BASE = Path("assistant/memory")
+# Paths — anchored to the repo root so memory always resolves to the
+# same directory regardless of where the process was launched from
+# (PM2, uvicorn from a different cwd, IDE run configurations, etc.).
+# Without this anchor, `Path("assistant/memory")` resolves against
+# os.getcwd() and silently writes to the wrong location.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+MEMORY_BASE = _REPO_ROOT / "assistant" / "memory"
 USERS_DIR = MEMORY_BASE / "users"
 SHARED_DIR = MEMORY_BASE / "shared"
 GLOBAL_PROFILE = MEMORY_BASE / "profile.json"
@@ -111,6 +116,7 @@ class UserMemory:
     """Memory storage for a specific user."""
     
     def __init__(self, user_id: str):
+        import threading as _threading
         self.user_id = user_id
         self.user_dir = USERS_DIR / user_id
         self.user_dir.mkdir(parents=True, exist_ok=True)
@@ -126,7 +132,14 @@ class UserMemory:
         # JSON invalidates the cache without explicit wiring.
         self._ep_emb_cache_key: Optional[Tuple[int, float]] = None
         self._ep_emb_cache: Optional[np.ndarray] = None
-        
+
+        # Lock around the episodic JSON file. The voice pipeline runs
+        # passive learning on a daemon thread while the main loop calls
+        # search_episodic — both read/write episodic.json. Without
+        # this lock a load/modify/save sequence on one side can clobber
+        # an interleaved write on the other (lost memory).
+        self._ep_lock = _threading.Lock()
+
         # Initialize SQLite for facts
         self._init_facts_db()
     
@@ -278,32 +291,35 @@ class UserMemory:
         if confidence < 0.5:
             return False
 
-        memories = self._load_episodic()
-        now = datetime.now().isoformat()
+        # Whole load-modify-save sequence under the lock so a concurrent
+        # search_episodic touch-update can't race the file rewrite.
+        with self._ep_lock:
+            memories = self._load_episodic()
+            now = datetime.now().isoformat()
 
-        # Check for duplicates (exact or near-duplicate via word-overlap)
-        for mem in memories:
-            if _similar_episodic(mem.get("text", ""), text):
-                # Merge: keep higher confidence, refresh timestamps
-                mem["confidence"] = max(mem.get("confidence", 0), confidence)
-                mem["updated_at"] = now
-                mem.setdefault("last_accessed", now)
-                mem["access_count"] = mem.get("access_count", 0) + 1
-                self._save_episodic(memories)
-                return True
+            # Check for duplicates (exact or near-duplicate via word-overlap)
+            for mem in memories:
+                if _similar_episodic(mem.get("text", ""), text):
+                    # Merge: keep higher confidence, refresh timestamps
+                    mem["confidence"] = max(mem.get("confidence", 0), confidence)
+                    mem["updated_at"] = now
+                    mem.setdefault("last_accessed", now)
+                    mem["access_count"] = mem.get("access_count", 0) + 1
+                    self._save_episodic(memories)
+                    return True
 
-        # Add new — include decay-tracking fields
-        memories.append({
-            "text": text,
-            "tags": tags or [],
-            "confidence": confidence,
-            "source": source,
-            "created_at": now,
-            "last_accessed": now,
-            "access_count": 0,
-        })
-        self._save_episodic(memories)
-        return True
+            # Add new — include decay-tracking fields
+            memories.append({
+                "text": text,
+                "tags": tags or [],
+                "confidence": confidence,
+                "source": source,
+                "created_at": now,
+                "last_accessed": now,
+                "access_count": 0,
+            })
+            self._save_episodic(memories)
+            return True
     
     @staticmethod
     def _recency_weight(mem: Dict, half_life_days: float = 30.0) -> float:
@@ -318,7 +334,11 @@ class UserMemory:
         try:
             ts = datetime.fromisoformat(ts_str)
             if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
+                # Timestamps are written via datetime.now().isoformat()
+                # — naive LOCAL time. astimezone() interprets naive as
+                # local; stamping them UTC instead skewed decay by the
+                # UTC offset and pinned everything newer than ~6h at 1.0.
+                ts = ts.astimezone()
             now = datetime.now(timezone.utc)
             days_ago = max(0.0, (now - ts).total_seconds() / 86400.0)
             return math.exp(-days_ago * math.log(2) / half_life_days)
@@ -332,7 +352,8 @@ class UserMemory:
         memories accessed recently rank higher than equally-relevant but stale ones.
         Updates last_accessed on returned memories.
         """
-        memories = self._load_episodic()
+        with self._ep_lock:
+            memories = self._load_episodic()
         if not memories:
             return []
 
@@ -383,22 +404,26 @@ class UserMemory:
                 logger.debug(f"Semantic search fallback to recency: {e}")
                 results = sorted(memories, key=self._recency_weight, reverse=True)[:n]
 
-        # Touch accessed memories to keep them fresh
+        # Touch accessed memories to keep them fresh. Re-read under
+        # the lock so we don't overwrite a concurrent add_episodic.
         accessed_texts = {r.get("text", "") for r in results}
-        changed = False
-        for mem in memories:
-            if mem.get("text", "") in accessed_texts:
-                mem["last_accessed"] = now
-                mem["access_count"] = mem.get("access_count", 0) + 1
-                changed = True
-        if changed:
-            self._save_episodic(memories)
+        with self._ep_lock:
+            current = self._load_episodic()
+            changed = False
+            for mem in current:
+                if mem.get("text", "") in accessed_texts:
+                    mem["last_accessed"] = now
+                    mem["access_count"] = mem.get("access_count", 0) + 1
+                    changed = True
+            if changed:
+                self._save_episodic(current)
 
         return results
     
     def get_recent_episodic(self, n: int = 10) -> List[Dict]:
         """Get most recent episodic memories."""
-        memories = self._load_episodic()
+        with self._ep_lock:
+            memories = self._load_episodic()
         # Sort by created_at descending
         sorted_mems = sorted(
             memories, 
@@ -551,6 +576,13 @@ class SharedMemory:
 _user_memories: Dict[str, UserMemory] = {}
 _shared_memory: Optional[SharedMemory] = None
 
+# Guards cache creation: the voice event-loop thread and the passive-
+# learning daemon thread both call get_user_memory. Without this, each
+# could construct its own UserMemory whose independent _ep_lock defeats
+# the episodic-file locking entirely.
+import threading as _mgr_threading
+_user_mem_lock = _mgr_threading.Lock()
+
 
 def get_user_memory(user_id: str = None) -> Optional[UserMemory]:
     """Get memory for a specific user or current user."""
@@ -559,11 +591,11 @@ def get_user_memory(user_id: str = None) -> Optional[UserMemory]:
         if current is None:
             return None
         user_id = current.user_id
-    
-    if user_id not in _user_memories:
-        _user_memories[user_id] = UserMemory(user_id)
-    
-    return _user_memories[user_id]
+
+    with _user_mem_lock:
+        if user_id not in _user_memories:
+            _user_memories[user_id] = UserMemory(user_id)
+        return _user_memories[user_id]
 
 
 def get_shared_memory() -> SharedMemory:

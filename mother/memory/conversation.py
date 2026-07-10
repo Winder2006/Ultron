@@ -10,7 +10,9 @@ from collections import deque
 
 from mother.llm.drivers import ChatMessage
 
-_HISTORY_BASE = Path("assistant/memory/users")
+# Anchor to repo root so persistence works regardless of process cwd.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_HISTORY_BASE = _REPO_ROOT / "assistant" / "memory" / "users"
 
 
 # When history grows past `max_turns`, the oldest `_SUMMARIZE_DROP_TURNS`
@@ -44,12 +46,14 @@ class ConversationMemory:
 
     def add_user(self, content: str) -> None:
         """Add a user message to history. Triggers compaction if needed."""
-        self._maybe_compact()
-        self._history.append(ChatMessage(role="user", content=content))
+        with self._summarize_lock:
+            self._maybe_compact()
+            self._history.append(ChatMessage(role="user", content=content))
 
     def add_assistant(self, content: str) -> None:
         """Add an assistant response to history."""
-        self._history.append(ChatMessage(role="assistant", content=content))
+        with self._summarize_lock:
+            self._history.append(ChatMessage(role="assistant", content=content))
 
     def get_messages(self, system_prompt: str) -> List[ChatMessage]:
         """Get full message list including system prompt and history.

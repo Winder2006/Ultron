@@ -376,6 +376,9 @@ export function useVoice() {
   const socketRef = useRef<VoiceSocket | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
+  // Muted sink for the mic processor — keeps the graph driving without
+  // routing audio back to the speakers (would cause feedback).
+  const sinkRef = useRef<GainNode | null>(null);
   const contextRef = useRef<AudioContext | null>(null);
   // Browser-side Silero VAD. One instance per hook, reused across
   // recordings — reset() is called at the start of each turn. Loaded
@@ -442,6 +445,15 @@ export function useVoice() {
         case 'tts_end': {
           // Sentence complete — worklet continues playing out its ring buffer.
           // Nothing to do here; the audio tail streams out naturally.
+          break;
+        }
+        case 'cancelled': {
+          // Server confirmed barge-in. Drop whatever's still buffered
+          // in the worklet so we don't keep speaking after the user
+          // cut us off.
+          stopAllAudio();
+          updates.processing = false;
+          updates.response = '';
           break;
         }
         case 'recording_started':
@@ -525,6 +537,12 @@ export function useVoice() {
     // Stop any in-progress TTS playback when user starts speaking
     stopAllAudio();
 
+    // Pre-warm the playback pipeline while the user is still talking.
+    // We're inside a user gesture here, so the AudioContext can be
+    // created/resumed and the PCM worklet module fetched NOW — instead
+    // of paying that 50-200ms setup when the first TTS chunk arrives.
+    ensureAudioContext().catch(() => { /* fallback path handles it */ });
+
     // Prep VAD in parallel with mic permission. Only instantiate when
     // a silence callback is requested (push-to-talk doesn't need it).
     // Reuse the instance across recordings — setCallback() swaps the
@@ -567,8 +585,13 @@ export function useVoice() {
       const ctx = new AudioContext({ sampleRate: 16000 });
       contextRef.current = ctx;
       const source = ctx.createMediaStreamSource(stream);
-      // ScriptProcessor for raw PCM — will migrate to AudioWorklet later
-      const processor = ctx.createScriptProcessor(4096, 1, 1);
+      // ScriptProcessor for raw PCM — will migrate to AudioWorklet later.
+      // 1024 samples = 64ms at 16kHz. The buffer size sets the floor on
+      // stopRecording's tail wait (we must let one full buffer flush
+      // before teardown): at 4096 that was ~256ms of dead time appended
+      // to EVERY turn. 64ms buffers still hold 2 full Silero VAD frames
+      // and the ~2ms inference fits the callback budget comfortably.
+      const processor = ctx.createScriptProcessor(1024, 1, 1);
       processorRef.current = processor;
 
       processor.onaudioprocess = (e) => {
@@ -588,7 +611,16 @@ export function useVoice() {
       };
 
       source.connect(processor);
-      processor.connect(ctx.destination);
+      // ScriptProcessorNode requires SOMETHING downstream to drive its
+      // onaudioprocess callback. Routing the mic to ctx.destination
+      // would echo it out the speakers (acoustic feedback on any
+      // machine without a headset). Route through a muted gain node
+      // instead — keeps the graph alive without producing output.
+      const sink = ctx.createGain();
+      sink.gain.value = 0;
+      processor.connect(sink);
+      sink.connect(ctx.destination);
+      sinkRef.current = sink;
 
       socketRef.current?.send('start');
       setState((s) => ({ ...s, transcript: '', response: '', micError: null }));
@@ -610,17 +642,42 @@ export function useVoice() {
     // paths without double-sending the stop message or double-closing
     // the AudioContext (AudioContext.close() on a closed context
     // throws in some browsers).
-    if (!processorRef.current && !mediaStreamRef.current) return;
-    processorRef.current?.disconnect();
-    processorRef.current = null;
-    try {
-      contextRef.current?.close();
-    } catch { /* already closed */ }
-    contextRef.current = null;
-    mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
-    mediaStreamRef.current = null;
+    const proc = processorRef.current;
+    const ctx = contextRef.current;
+    const stream = mediaStreamRef.current;
+    const sink = sinkRef.current;
+    if (!proc && !stream) return;
 
-    socketRef.current?.send('stop');
+    // ── Tail capture before cutoff ──
+    // The ScriptProcessorNode buffers 1024 samples (~64 ms at
+    // 16 kHz) before each onaudioprocess fires. If we disconnect
+    // immediately, that pending buffer is dropped — which is why
+    // releasing PTT mid-word loses the last syllable. Hold the
+    // audio path open for one full buffer period plus a small
+    // margin, let the next callback flush, THEN tear down and
+    // signal stop. The server won't close Deepgram's input stream
+    // until it sees `stop`, so the trailing chunk gets transcribed
+    // properly. This value must stay > the processor buffer period
+    // (64ms) — it was 300ms when the buffer was 4096 samples, which
+    // added ~a quarter second of dead air to every single turn.
+    const TAIL_MS = 120;
+    setTimeout(() => {
+      try { proc?.disconnect(); } catch { /* already disconnected */ }
+      try { sink?.disconnect(); } catch { /* already disconnected */ }
+      try { ctx?.close(); } catch { /* already closed */ }
+      stream?.getTracks().forEach((t) => t.stop());
+      // Null out refs only AFTER the teardown so a re-press during
+      // the tail window is rejected by the startRecording guard
+      // (we don't want two overlapping audio contexts).
+      processorRef.current = null;
+      contextRef.current = null;
+      mediaStreamRef.current = null;
+      sinkRef.current = null;
+      // Send stop AFTER the trailing chunk has had time to leave
+      // the browser and reach Deepgram. Otherwise the server-side
+      // close-stream beats the last audio packet.
+      socketRef.current?.send('stop');
+    }, TAIL_MS);
   }, []);
 
   const sendPrompt = useCallback(async (text: string) => {
@@ -633,6 +690,8 @@ export function useVoice() {
     }
     // Stop any in-progress TTS when sending a new prompt
     stopAllAudio();
+    // Pre-warm playback (context + worklet) while the LLM thinks.
+    ensureAudioContext().catch(() => { /* fallback path handles it */ });
     setState((s) => ({ ...s, transcript: text, response: '', processing: true }));
     sock.sendPrompt(text);
   }, []);
@@ -663,6 +722,18 @@ export function useVoice() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /**
+   * Barge-in: stop whatever Ultron is saying right now and cancel the
+   * in-flight LLM/TTS pipeline. Safe to call any time — it's a no-op
+   * when nothing is playing. Stops local playback immediately so we
+   * don't have to wait for the server's `cancelled` confirmation.
+   */
+  const interrupt = useCallback(() => {
+    stopAllAudio();
+    socketRef.current?.send('cancel');
+    setState((s) => ({ ...s, processing: false, response: '' }));
+  }, []);
+
   return {
     ...state,
     connect,
@@ -670,5 +741,6 @@ export function useVoice() {
     startRecording,
     stopRecording,
     sendPrompt,
+    interrupt,
   };
 }

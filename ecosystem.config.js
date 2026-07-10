@@ -66,6 +66,45 @@ module.exports = {
     },
 
     {
+      // RAG service — FAISS over notes + code index, embeddings via
+      // MiniLM ONNX. Backend's voice route hits it for self-awareness
+      // (search_code tool, code-aware context injection) and notes RAG.
+      // Optional: if this process is down, the backend falls back to
+      // empty RAG silently — Ultron still works, just loses memory of
+      // his own architecture and the user's notes.
+      //
+      // Bound to 127.0.0.1 only — never expose this directly. The
+      // backend is the only legitimate caller; the dashboard never
+      // talks to it.
+      name: 'ultron-rag',
+      script: pythonExe,
+      args: [
+        '-m', 'uvicorn',
+        'assistant.app:app',
+        '--host', '127.0.0.1',
+        '--port', '8123',
+      ],
+      cwd: repoRoot,
+
+      autorestart: true,
+      max_restarts: 10,
+      min_uptime: '30s',
+      restart_delay: 2000,
+      // FAISS index + MiniLM session sit in RAM. 1.5GB is generous
+      // headroom — typical RSS is ~400-600MB.
+      max_memory_restart: '1500M',
+
+      out_file: path.join(repoRoot, 'logs', 'pm2-rag-out.log'),
+      error_file: path.join(repoRoot, 'logs', 'pm2-rag-err.log'),
+      merge_logs: true,
+      time: true,
+
+      env: {
+        PYTHONUNBUFFERED: '1',
+      },
+    },
+
+    {
       // Vite dev server for the React dashboard.
       //
       // PM2 on Windows doesn't play well with `npm.cmd` — it tries to

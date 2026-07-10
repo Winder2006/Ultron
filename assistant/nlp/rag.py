@@ -4,7 +4,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 import faiss  # type: ignore
 import numpy as np
@@ -138,7 +138,11 @@ def _mmr(query_vec: np.ndarray, cand_vecs: np.ndarray, topk: int, lam: float = 0
     return selected
 
 
-_CACHE = {"index": None, "meta": None, "idx_mtime": 0.0, "meta_mtime": 0.0}
+# Cache keyed by (index_path, meta_path) so the notes index and the
+# code index can both stay loaded simultaneously. The previous single-
+# slot dict thrashed on every alternation between /search and
+# /code-search, reloading FAISS from disk (~50ms) on every call.
+_CACHE: Dict[Tuple[str, str], Dict] = {}
 
 
 def _maybe_load_cache(index_path: str, meta_path: str) -> tuple[faiss.Index | None, List[Dict] | None]:  # type: ignore[name-defined]
@@ -147,12 +151,15 @@ def _maybe_load_cache(index_path: str, meta_path: str) -> tuple[faiss.Index | No
         return None, None
     idx_m = ip.stat().st_mtime
     mt_m = mp.stat().st_mtime
-    if _CACHE["index"] is None or _CACHE["meta"] is None or _CACHE["idx_mtime"] != idx_m or _CACHE["meta_mtime"] != mt_m:
+    key = (index_path, meta_path)
+    entry = _CACHE.get(key)
+    if entry is None or entry["idx_mtime"] != idx_m or entry["meta_mtime"] != mt_m:
         idx = faiss.read_index(index_path)
         with mp.open("r", encoding="utf-8") as f:
             meta = json.load(f)
-        _CACHE.update({"index": idx, "meta": meta, "idx_mtime": idx_m, "meta_mtime": mt_m})
-    return _CACHE["index"], _CACHE["meta"]
+        entry = {"index": idx, "meta": meta, "idx_mtime": idx_m, "meta_mtime": mt_m}
+        _CACHE[key] = entry
+    return entry["index"], entry["meta"]
 
 
 def warm_cache(index_path: str, meta_path: str) -> bool:

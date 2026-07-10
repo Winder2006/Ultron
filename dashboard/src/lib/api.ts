@@ -1,7 +1,10 @@
 /** MOTHER API client — REST, SSE, and WebSocket connections. */
 
 const API_BASE = '/api';
-const WS_BASE = `ws://${window.location.host}`;
+// Use wss:// when the page is loaded over HTTPS — browsers block a
+// ws:// upgrade from an https:// origin as mixed content, which made
+// every TLS-terminated deploy (Railway, Cloudflare, etc.) unreachable.
+const WS_BASE = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`;
 
 // ── REST ──
 

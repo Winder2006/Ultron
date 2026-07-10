@@ -236,7 +236,7 @@ def get_forecast(args: dict) -> str:
             day_name = datetime.fromisoformat(dates[i]).strftime("%A")
         except Exception:
             day_name = dates[i]
-        desc = _WEATHER_CODE_DESC.get(int(codes[i]), "varied") if codes else "varied"
+        desc = _WEATHER_CODE_DESC.get(int(codes[i]), "varied") if i < len(codes) else "varied"
         hi = round(highs[i]) if i < len(highs) else "?"
         lo = round(lows[i]) if i < len(lows) else "?"
         pop = f", {precips[i]}% rain" if i < len(precips) and precips[i] else ""
@@ -727,3 +727,159 @@ def correct_fact(args: dict, *, current_user=None) -> str:
         return f"Noted: {key} is {value}."
     except Exception as e:
         return f"Correction failed: {e}"
+
+
+# ───────────────────────── fetch_url ────────────────────────────────
+# Lets the LLM dig deeper than search snippets — given a URL from a
+# prior brave_web_search or search_info hit, grab the page's main
+# text content. Combined with ReAct chaining: search → pick the most
+# promising hit → fetch_url → answer with real grounded context.
+
+# Hosts/IPs we never fetch (SSRF guard).
+_PRIVATE_HOST_PREFIXES = (
+    "localhost", "127.", "0.", "169.254.",
+    "10.", "192.168.",
+    # 172.16.0.0/12 — covers .16 through .31
+    "172.16.", "172.17.", "172.18.", "172.19.",
+    "172.20.", "172.21.", "172.22.", "172.23.",
+    "172.24.", "172.25.", "172.26.", "172.27.",
+    "172.28.", "172.29.", "172.30.", "172.31.",
+)
+
+_FETCH_MAX_BYTES = 400_000   # ~400KB cap on the raw response
+_FETCH_MAX_CHARS = 4_000     # ~4K chars of cleaned text returned to LLM
+_FETCH_TIMEOUT_S = 8.0
+_FETCH_USER_AGENT = (
+    "Mozilla/5.0 (compatible; UltronBot/1.0; "
+    "+https://github.com/anthropics/claude-code)"
+)
+
+
+def _is_safe_url(url: str) -> tuple[bool, str]:
+    """Return (ok, reason). Blocks file://, internal hosts, weird schemes."""
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(url)
+    except Exception as e:
+        return False, f"could not parse URL ({e})"
+    if p.scheme not in ("http", "https"):
+        return False, f"only http/https allowed, got {p.scheme!r}"
+    host = (p.hostname or "").lower()
+    if not host:
+        return False, "no host in URL"
+    for prefix in _PRIVATE_HOST_PREFIXES:
+        if host == prefix.rstrip(".") or host.startswith(prefix):
+            return False, f"refusing to fetch internal host {host!r}"
+    return True, ""
+
+
+def _html_to_text(html: str) -> str:
+    """Pull readable text out of an HTML document.
+
+    Uses BeautifulSoup to strip script/style/nav/footer/aside, then
+    collapses whitespace. Not as fancy as readability/trafilatura but
+    good enough for "summarize this page" use cases without adding a
+    dependency.
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        # bs4 not present — fall back to a crude regex. Worse output
+        # but doesn't break the tool entirely.
+        text = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.I)
+        text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.I)
+        text = re.sub(r"<[^>]+>", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    soup = BeautifulSoup(html, "html.parser")
+    # Drop noise tags entirely.
+    for tag in soup(("script", "style", "noscript", "iframe", "svg",
+                     "nav", "header", "footer", "aside", "form")):
+        tag.decompose()
+
+    # Prefer <main> / <article> / first big <section> if present —
+    # most modern news/profile sites mark the main content this way.
+    main = soup.find("main") or soup.find("article")
+    target = main if main else soup.body or soup
+    text = target.get_text(separator=" ", strip=True)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def fetch_url(args: dict) -> str:
+    """Fetch a URL and return its text content (cleaned, truncated).
+
+    Args:
+        url: the URL to fetch
+        max_chars (optional): cap on returned chars (default 4000)
+    """
+    url = (args.get("url") or "").strip()
+    if not url:
+        return "No URL provided."
+    if not url.lower().startswith(("http://", "https://")):
+        url = "https://" + url
+
+    ok, reason = _is_safe_url(url)
+    if not ok:
+        return f"Refusing to fetch: {reason}."
+
+    try:
+        max_chars = int(args.get("max_chars", _FETCH_MAX_CHARS))
+    except (TypeError, ValueError):
+        max_chars = _FETCH_MAX_CHARS
+    max_chars = max(200, min(max_chars, 8_000))
+
+    try:
+        with httpx.Client(
+            timeout=_FETCH_TIMEOUT_S,
+            follow_redirects=True,
+            headers={"User-Agent": _FETCH_USER_AGENT, "Accept": "text/html,*/*"},
+        ) as client:
+            resp = client.get(url)
+    except httpx.TimeoutException:
+        return f"Fetch timed out after {_FETCH_TIMEOUT_S}s."
+    except httpx.HTTPError as e:
+        return f"Fetch failed: {e}"
+
+    # Validate the final URL after redirects — defends against
+    # redirect-to-private-IP attacks.
+    final_url = str(resp.url)
+    ok, reason = _is_safe_url(final_url)
+    if not ok:
+        return f"Refusing to follow redirect: {reason}."
+
+    if resp.status_code >= 400:
+        return f"Fetch returned HTTP {resp.status_code}."
+
+    ctype = (resp.headers.get("content-type") or "").lower()
+    body_bytes = resp.content[:_FETCH_MAX_BYTES]
+
+    if "html" in ctype or body_bytes.lstrip().startswith((b"<!", b"<htm", b"<HTM")):
+        text = _html_to_text(body_bytes.decode("utf-8", errors="replace"))
+    elif "text/" in ctype or "json" in ctype:
+        text = body_bytes.decode("utf-8", errors="replace")
+        text = re.sub(r"\s+", " ", text).strip()
+    else:
+        return f"Unsupported content-type: {ctype or 'unknown'}."
+
+    if not text:
+        return "Page fetched but no readable text extracted."
+
+    # Title hint helps the LLM ground the answer
+    title = ""
+    try:
+        from bs4 import BeautifulSoup
+        if "html" in ctype:
+            t = BeautifulSoup(body_bytes, "html.parser").find("title")
+            if t and t.string:
+                title = t.string.strip()[:160]
+    except Exception:
+        pass
+
+    if len(text) > max_chars:
+        text = text[:max_chars].rsplit(" ", 1)[0] + " …"
+
+    header = f"URL: {final_url}\n"
+    if title:
+        header += f"Title: {title}\n"
+    return header + f"\n{text}"

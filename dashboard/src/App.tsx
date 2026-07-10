@@ -34,6 +34,12 @@ export default function App() {
   // recording length and let the backend's empty-transcript guard
   // handle true silence gracefully.
   const autoStopTimerRef = useRef<number | null>(null);
+  // True while the CURRENT recording was started by the wake word.
+  // The stop-on-final-transcript effect below must only apply to
+  // wake-word turns: during push-to-talk the user is still holding
+  // the button, and Deepgram emits a "final" at any natural pause —
+  // auto-stopping there cut off multi-sentence input mid-thought.
+  const wakeTurnRef = useRef(false);
   const clearAutoStop = useCallback(() => {
     if (autoStopTimerRef.current !== null) {
       window.clearTimeout(autoStopTimerRef.current);
@@ -55,6 +61,13 @@ export default function App() {
 
   const handleMicPress = useCallback(() => {
     clearAutoStop();  // user took over from wake-word — cancel timer
+    wakeTurnRef.current = false;  // push-to-talk: user controls the stop
+    // Barge-in: if Ultron is currently speaking or thinking, cut him
+    // off before opening the mic. The interrupt is local-instant so
+    // playback stops the moment the button is pressed.
+    if (voice.processing) {
+      voice.interrupt();
+    }
     voice.startRecording();
   }, [voice, clearAutoStop]);
 
@@ -76,15 +89,24 @@ export default function App() {
     // Short debounce so double-utterances don't both fire, but fast
     // enough to feel responsive if user tries again after a miss.
     debounceSeconds: 1.5,
-    // Suppress while: already recording, still waiting for response,
-    // or the voice WS isn't actually open. Without this, Ultron saying
-    // phonetically-adjacent words in his response would re-trigger
-    // himself endlessly.
+    // Suppress only while we're already recording or the WS isn't
+    // open. We DELIBERATELY allow wake-word to fire while Ultron is
+    // mid-response so the user can interrupt by name — barge-in.
+    // Echo cancellation on the mic stream + the voice filter chain's
+    // distinctive timbre keep self-triggering rare in practice; if
+    // false-fires become a problem on speaker setups, gate this with
+    // a settings flag.
     isSuppressed: () =>
-      voice.recording || voice.processing || !voice.connected,
+      voice.recording || !voice.connected,
     onDetected: () => {
-      if (voice.recording || voice.processing) return;
+      if (voice.recording) return;
+      // If Ultron is currently speaking/thinking, this wake-word fire
+      // is a barge-in. Cut him off first so the new turn lands clean.
+      if (voice.processing) {
+        voice.interrupt();
+      }
       clearAutoStop();
+      wakeTurnRef.current = true;  // hands-free turn — auto-stop applies
       // Pass a silence callback so the browser's Silero VAD auto-stops
       // as soon as the user finishes talking (typically ~700ms after
       // last syllable) — no more waiting for the 5s ceiling or for
@@ -108,10 +130,14 @@ export default function App() {
   // the authoritative signal that the user finished speaking. Cuts
   // typical wake-word turnaround from 5-7s down to ~1s after the last
   // syllable, which is what every competent voice assistant does.
+  // WAKE-WORD TURNS ONLY: during push-to-talk the user is still
+  // holding the button, and Deepgram finalizes at every natural pause
+  // — auto-stopping there truncated multi-sentence input.
   useEffect(() => {
     const ev = voice.lastEvent;
     if (!ev || ev.event !== 'stt' || !ev.final) return;
     if (!voice.recording) return;
+    if (!wakeTurnRef.current) return;
     // Let the last audio flush through before stopping — a tiny pad
     // so we don't clip the trailing phoneme.
     const t = window.setTimeout(() => {

@@ -98,6 +98,18 @@ async def _get(
     return None
 
 
+_ASYNC_CLIENT = None
+
+
+def _shared_async_client() -> "httpx.AsyncClient":
+    """Process-wide async client so per-turn RAG fetches reuse their
+    TCP connection instead of handshaking every turn."""
+    global _ASYNC_CLIENT
+    if _ASYNC_CLIENT is None or _ASYNC_CLIENT.is_closed:
+        _ASYNC_CLIENT = httpx.AsyncClient()
+    return _ASYNC_CLIENT
+
+
 async def fetch_context(
     text: str,
     *,
@@ -133,23 +145,26 @@ async def fetch_context(
     timeout_s = max(0.1, timeout_ms / 1000.0)
     want_code = enable_code and (force_code or looks_like_code_query(text))
 
-    async with httpx.AsyncClient() as client:
-        coros = []
-        if enable_notes:
-            coros.append(
-                _get(client, f"{api_base}/search", {"q": text, "k": notes_k}, timeout_s)
-            )
-        else:
-            coros.append(asyncio.sleep(0, result=None))  # type: ignore[arg-type]
+    # Shared client — this runs on the per-turn hot path, and creating
+    # a fresh AsyncClient per call paid a new TCP handshake to the RAG
+    # service on every single turn.
+    client = _shared_async_client()
+    coros = []
+    if enable_notes:
+        coros.append(
+            _get(client, f"{api_base}/search", {"q": text, "k": notes_k}, timeout_s)
+        )
+    else:
+        coros.append(asyncio.sleep(0, result=None))  # type: ignore[arg-type]
 
-        if want_code:
-            coros.append(
-                _get(client, f"{api_base}/code-search", {"q": text, "k": code_k}, timeout_s)
-            )
-        else:
-            coros.append(asyncio.sleep(0, result=None))  # type: ignore[arg-type]
+    if want_code:
+        coros.append(
+            _get(client, f"{api_base}/code-search", {"q": text, "k": code_k}, timeout_s)
+        )
+    else:
+        coros.append(asyncio.sleep(0, result=None))  # type: ignore[arg-type]
 
-        notes_hits, code_hits = await asyncio.gather(*coros, return_exceptions=False)
+    notes_hits, code_hits = await asyncio.gather(*coros, return_exceptions=False)
 
     blocks: List[str] = []
 
@@ -197,8 +212,10 @@ def fetch_context_sync(
                     params={"q": text, "k": notes_k},
                     timeout=timeout_s,
                 )
-                if r.status_code == 200 and isinstance(r.json(), list):
-                    notes_hits = r.json()
+                if r.status_code == 200:
+                    data = r.json()
+                    if isinstance(data, list):
+                        notes_hits = data
             except Exception:
                 pass
         if want_code:
@@ -208,8 +225,10 @@ def fetch_context_sync(
                     params={"q": text, "k": code_k},
                     timeout=timeout_s,
                 )
-                if r.status_code == 200 and isinstance(r.json(), list):
-                    code_hits = r.json()
+                if r.status_code == 200:
+                    data = r.json()
+                    if isinstance(data, list):
+                        code_hits = data
             except Exception:
                 pass
 

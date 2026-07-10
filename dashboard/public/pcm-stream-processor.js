@@ -114,8 +114,13 @@ class PCMStreamProcessor extends AudioWorkletProcessor {
     const quantumSize = channel.length;  // always 128 in current spec
 
     // How many source samples we need to read to produce `quantumSize`
-    // output samples, given the current pitchRate.
-    const neededSource = quantumSize * this.pitchRate;
+    // output samples. While a pitch change is smoothing, the per-sample
+    // loop below advances at a rate ramping toward targetPitchRate —
+    // budget for the FASTER of the two rates, otherwise a transition to
+    // a higher rate near buffer exhaustion reads past writeIndex and
+    // plays a burst of stale ring contents from the previous response.
+    const planningRate = Math.max(this.pitchRate, this.targetPitchRate);
+    const neededSource = quantumSize * planningRate;
     const available = this.writeIndex - this.readCursor;
 
     if (available >= neededSource + 1) {
