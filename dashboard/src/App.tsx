@@ -4,6 +4,7 @@ import StatusPanel from './components/StatusPanel';
 import ConversationFeed from './components/ConversationFeed';
 import FilterPanel from './components/FilterPanel';
 import ObservabilityPanel from './components/ObservabilityPanel';
+import ExecPanel from './components/ExecPanel';
 import { useMotherAPI } from './hooks/useMotherAPI';
 import { useVoice } from './hooks/useVoice';
 import { useWakeWord } from './hooks/useWakeWord';
@@ -18,7 +19,35 @@ export default function App() {
   const mother = useMotherAPI();
   const voice = useVoice();
   const [showPanels, setShowPanels] = useState(false);
+  const [showExec, setShowExec] = useState(false);
   const [time, setTime] = useState(new Date());
+
+  // Auto-open the code window the moment a code_exec event lands —
+  // the whole point of running code visibly is lost if it renders on
+  // a route the user never has open. Track the latest exec timestamp
+  // so re-renders don't re-open a panel the user just closed.
+  const lastExecTsRef = useRef<number | null>(null);
+  useEffect(() => {
+    const latest = mother.events.find((e) => e.type === 'code_exec');
+    if (!latest) return;
+    const ts = (latest.ts as number) ?? 0;
+    if (lastExecTsRef.current === ts) return;
+    lastExecTsRef.current = ts;
+    setShowExec(true);
+  }, [mother.events]);
+
+  // Esc closes the topmost layer: the code window if it's open,
+  // otherwise the slide-out panels.
+  useEffect(() => {
+    if (!showExec && !showPanels) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      if (showExec) setShowExec(false);
+      else setShowPanels(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [showExec, showPanels]);
 
   const [wakeEnabled, setWakeEnabled] = useState<boolean>(() => {
     try { return localStorage.getItem(WAKE_TOGGLE_KEY) === '1'; }
@@ -116,13 +145,14 @@ export default function App() {
         voice.stopRecording();
         clearAutoStop();
       });
-      // 6s hard ceiling. With VAD the typical stop is ~1-2s into
-      // recording; this only trips if VAD somehow fails to detect
-      // end of speech (e.g. constant loud background noise).
+      // 30s hard ceiling — a true safety net, not a turn length. The
+      // old 6s ceiling chopped any long question mid-sentence; with
+      // the VAD handling normal end-of-speech, this only trips on
+      // constant loud background noise defeating the VAD.
       autoStopTimerRef.current = window.setTimeout(() => {
         voice.stopRecording();
         autoStopTimerRef.current = null;
-      }, 6000);
+      }, 30000);
     },
   });
 
@@ -138,12 +168,18 @@ export default function App() {
     if (!ev || ev.event !== 'stt' || !ev.final) return;
     if (!voice.recording) return;
     if (!wakeTurnRef.current) return;
-    // Let the last audio flush through before stopping — a tiny pad
-    // so we don't clip the trailing phoneme.
+    // FALLBACK stopper only. Deepgram emits a "final" at every ~300ms
+    // breath pause, so stopping 150ms after one was cutting off
+    // multi-sentence questions mid-thought. The Silero VAD (adaptive
+    // 550-850ms silence) is the primary end-of-turn signal; this
+    // timer only matters when the VAD failed to load. 1.2s of silence
+    // after a final means the user genuinely stopped — and if they
+    // kept talking, the next audio makes Deepgram emit new events and
+    // this effect re-arms with a fresh timer.
     const t = window.setTimeout(() => {
       voice.stopRecording();
       clearAutoStop();
-    }, 150);
+    }, 1200);
     return () => window.clearTimeout(t);
   }, [voice.lastEvent, voice.recording, voice, clearAutoStop]);
 
@@ -227,14 +263,18 @@ export default function App() {
         )`,
       }} />
 
-      {/* Top-right controls */}
+      {/* Top-right controls. zIndex must stay ABOVE the slide-out
+          panels (30) — at 20 the right panel covered these buttons,
+          so once the panels were open there was no visible way to
+          close them again. Kept below the exec overlay (40), which
+          has its own close controls. */}
       <div style={{
         position: 'fixed',
         top: 16,
         right: 16,
         display: 'flex',
         gap: 8,
-        zIndex: 20,
+        zIndex: 35,
       }}>
         {/* Mic button — hold to talk */}
         <button
@@ -329,6 +369,32 @@ export default function App() {
           }}
         >
           HJ
+        </button>
+        {/* Code window toggle — same cells as /exec, on this screen */}
+        <button
+          onClick={() => setShowExec((v) => !v)}
+          title="Toggle code window (auto-opens when Ultron runs Python)"
+          style={{
+            width: 36,
+            height: 36,
+            border: showExec
+              ? '1px solid rgba(92, 255, 142, 0.5)'
+              : '1px solid rgba(255, 51, 68, 0.15)',
+            borderRadius: 8,
+            background: showExec ? 'rgba(92, 255, 142, 0.10)' : 'rgba(255, 51, 68, 0.05)',
+            color: showExec ? 'rgba(92, 255, 142, 0.9)' : 'rgba(255, 51, 68, 0.5)',
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            fontSize: 11,
+            fontFamily: 'var(--font-mono)',
+            fontWeight: 600,
+            letterSpacing: 0.5,
+            transition: 'all 0.15s',
+          }}
+        >
+          {'>_'}
         </button>
         <button
           onClick={() => setShowPanels(!showPanels)}
@@ -573,6 +639,11 @@ export default function App() {
             />
           </div>
         </>
+      )}
+
+      {/* Code execution window — overlay version of /exec */}
+      {showExec && (
+        <ExecPanel events={mother.events} onClose={() => setShowExec(false)} />
       )}
     </>
   );

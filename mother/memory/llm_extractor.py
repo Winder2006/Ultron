@@ -33,8 +33,10 @@ from typing import List, Tuple, Optional
 
 # Tier 1 extraction model. Can be overridden via env for experimentation
 # without reloading config. Defaults match configs/app.yaml tier1.
+# (llama-3.1-8b was retired by Cerebras 2026-07 and 404s — keep this
+# in sync with the tier1 model in configs/app.yaml.)
 DEFAULT_EXTRACT_MODEL = os.environ.get(
-    "ULTRON_EXTRACT_MODEL", "cerebras/llama-3.1-8b"
+    "ULTRON_EXTRACT_MODEL", "cerebras/gemma-4-31b"
 )
 
 

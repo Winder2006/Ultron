@@ -1,4 +1,4 @@
-"""Conversation memory for multi-turn context awareness."""
+﻿"""Conversation memory for multi-turn context awareness."""
 from __future__ import annotations
 
 import json
@@ -17,7 +17,7 @@ _HISTORY_BASE = _REPO_ROOT / "assistant" / "memory" / "users"
 
 # When history grows past `max_turns`, the oldest `_SUMMARIZE_DROP_TURNS`
 # turns are summarized into `summary` and then dropped from the deque.
-# Keeping this small (2 turns per compaction) avoids thrashing — we
+# Keeping this small (2 turns per compaction) avoids thrashing â€” we
 # summarize just enough to make room for the new turn without losing
 # recent context abruptly.
 _SUMMARIZE_DROP_TURNS = 2
@@ -37,8 +37,13 @@ class ConversationMemory:
     injected into the system prompt every turn. Ultron remembers
     yesterday without eating the context window."""
 
-    max_turns: int = 4  # Keep last 4 exchanges (8 messages)
-    _history: deque = field(default_factory=lambda: deque(maxlen=8))
+    # 20 exchanges (40 messages). The driver now places a MOVING cache
+    # breakpoint on the last message (drivers.py), so the conversation
+    # prefix genuinely hits Anthropic's prompt cache across turns —
+    # widened history costs one cache-read (0.1x price) instead of full
+    # re-processing. Twenty exchanges ≈ the last 15-20 minutes verbatim.
+    max_turns: int = 20
+    _history: deque = field(default_factory=lambda: deque(maxlen=40))
     summary: str = ""  # Compacted history beyond the active window.
     _summarize_lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False
@@ -79,7 +84,7 @@ class ConversationMemory:
         self._history.clear()
         self.summary = ""
 
-    # ── Rolling summary compaction ──────────────────────────────────
+    # â”€â”€ Rolling summary compaction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _maybe_compact(self) -> None:
         """If history is at capacity, summarize the oldest turns inline.
@@ -110,7 +115,7 @@ class ConversationMemory:
         except Exception:
             pass  # drop-turns still happens; summary just doesn't grow
 
-    # ── Persistence ──────────────────────────────────────────────────────────
+    # â”€â”€ Persistence â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def save(self, user_id: str) -> None:
         """Persist the conversation window (and rolling summary) to disk.
@@ -152,7 +157,7 @@ class ConversationMemory:
                 if role and content:
                     self._history.append(ChatMessage(role=role, content=content))
         except Exception:
-            pass  # Corrupt history — start fresh
+            pass  # Corrupt history â€” start fresh
     
     def summarize_for_context(self, max_chars: int = 500) -> str:
         """Get a brief summary of recent conversation for context injection.
@@ -217,7 +222,7 @@ def reset_memory() -> None:
     _global_memory = ConversationMemory()
 
 
-# ────────────────────── Summary helpers ─────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Summary helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #
 # Kept at module level so `ConversationMemory` stays small and easy to
 # test. Both helpers are safe to call with no LLM configured: they fall
@@ -239,7 +244,7 @@ def _summarize_turns(turns: List[ChatMessage], *, prior: str = "") -> str:
         who = "User" if m.role == "user" else "Ultron"
         content = (m.content or "").strip().replace("\n", " ")
         if len(content) > 300:
-            content = content[:300] + "…"
+            content = content[:300] + "â€¦"
         lines.append(f"{who}: {content}")
     transcript = "\n".join(lines)
 
@@ -261,7 +266,7 @@ def _summarize_turns(turns: List[ChatMessage], *, prior: str = "") -> str:
     try:
         import litellm
         import os
-        model = os.environ.get("ULTRON_SUMMARY_MODEL", "cerebras/llama-3.1-8b")
+        model = os.environ.get("ULTRON_SUMMARY_MODEL", "cerebras/gemma-4-31b")
         r = litellm.completion(
             model=model,
             messages=[
@@ -305,7 +310,7 @@ def _recompress_summary(combined: str) -> str:
     try:
         import litellm
         import os
-        model = os.environ.get("ULTRON_SUMMARY_MODEL", "cerebras/llama-3.1-8b")
+        model = os.environ.get("ULTRON_SUMMARY_MODEL", "cerebras/gemma-4-31b")
         r = litellm.completion(
             model=model,
             messages=[
@@ -326,7 +331,7 @@ def _recompress_summary(combined: str) -> str:
         pass
     # Fallback: keep the newest tail. Better than keeping the oldest.
     overflow = len(combined) - _SUMMARY_CHAR_BUDGET
-    return "…" + combined[overflow + 1:]
+    return "â€¦" + combined[overflow + 1:]
 
 
 def _merge_summary(prior: str, addition: str) -> str:

@@ -46,3 +46,6 @@ paho-mqtt>=2.0.0                # Phase 6 — vision events
 
 # Utilities
 python-dotenv>=1.0.0
+
+yfinance>=1.5  # live stock quotes for get_stock_price
+psutil>=5.9  # system self-monitoring for system_status tool

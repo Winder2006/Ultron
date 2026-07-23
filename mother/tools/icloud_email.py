@@ -10,11 +10,11 @@ Tool surface (registered in mother/llm/tools.py):
   • read_email        — full body of one message by uid
 
 Design choices:
-  • Connection is per-call, NOT cached. iCloud aggressively idles
-    long-lived IMAP connections and re-handshaking takes ~300ms which
-    is acceptable for an on-demand voice query. A future optimization
-    is a connection pool with idle keepalive, but it's not worth the
-    complexity yet.
+  • Connection is cached across calls (module-level, lock-guarded) so
+    each tool call skips the ~300ms TLS+login handshake. The cached
+    connection is validated cheaply before use and re-logged-in once
+    if iCloud has idled it out. All sockets carry a 15s timeout so a
+    dead network can't hang the worker thread forever.
   • Read-only: SEEN flag is preserved (we use BODY.PEEK semantics).
     No moves, no deletes, no marks.
   • Sender names are stripped of email addresses for TTS — "Charles
@@ -30,6 +30,8 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
@@ -38,6 +40,9 @@ logger = logging.getLogger("mother.tools.icloud_email")
 
 ICLOUD_IMAP_HOST = "imap.mail.me.com"
 ICLOUD_IMAP_PORT = 993
+# Socket timeout for every IMAP operation. Without this a dead network
+# blocks the worker thread forever (imaplib's default is no timeout).
+ICLOUD_IMAP_TIMEOUT_S = 15
 
 
 def _get_creds() -> tuple[Optional[str], Optional[str]]:
@@ -91,8 +96,8 @@ def _html_to_plain(html: str) -> str:
 
 
 def _connect():
-    """Open a fresh IMAP connection. Caller is responsible for closing
-    via the context manager `with` statement."""
+    """Open a fresh IMAP connection and log in. Prefer `_mailbox()`,
+    which reuses a cached connection across tool calls."""
     user, pw = _get_creds()
     if not user or not pw:
         raise RuntimeError(
@@ -100,20 +105,81 @@ def _connect():
             "ICLOUD_APP_PASSWORD to .env"
         )
     from imap_tools import MailBox
-    mailbox = MailBox(ICLOUD_IMAP_HOST, ICLOUD_IMAP_PORT)
+    mailbox = MailBox(
+        ICLOUD_IMAP_HOST, ICLOUD_IMAP_PORT, timeout=ICLOUD_IMAP_TIMEOUT_S,
+    )
     mailbox.login(user, pw, initial_folder="INBOX")
     return mailbox
+
+
+# Cached logged-in MailBox shared across tool calls, so each voice query
+# skips the ~300ms+ TLS handshake + LOGIN round-trips. IMAP connections
+# are stateful and not safe for concurrent use, so the lock is held for
+# the whole operation, serializing email tool calls (fine — they're rare
+# and user-driven).
+_mb_lock = threading.Lock()
+_mb_cached = None  # type: Optional[object]
+
+
+@contextmanager
+def _mailbox():
+    """Yield a live, logged-in MailBox.
+
+    Reuses the cached connection when possible: validates it with a
+    cheap `folder.set('INBOX')` (which also resets folder state for the
+    caller); on any failure — iCloud idled the socket, network blip —
+    discards and re-logs-in once. Unlike `with MailBox().login(...)`,
+    this does NOT log out on exit; the connection stays warm for the
+    next call. If the operation itself raises, the connection state is
+    suspect, so it is discarded and the exception propagates.
+    """
+    global _mb_cached
+    with _mb_lock:
+        mb = _mb_cached
+        if mb is not None:
+            try:
+                mb.folder.set("INBOX")
+            except Exception:
+                try:
+                    mb.logout()
+                except Exception:
+                    pass
+                mb = None
+                _mb_cached = None
+        if mb is None:
+            mb = _connect()
+            _mb_cached = mb
+        try:
+            yield mb
+        except Exception:
+            _mb_cached = None
+            try:
+                mb.logout()
+            except Exception:
+                pass
+            raise
 
 
 # ─────────────────────── core fetch ────────────────────────────────
 
 
-def fetch_recent(hours: int = 24, max_messages: int = 20) -> List[EmailSummary]:
-    """Pull recent messages (any seen state) from INBOX within `hours`."""
+def fetch_recent(
+    hours: int = 24, max_messages: int = 20, *, dedicated: bool = False,
+) -> List[EmailSummary]:
+    """Pull recent messages (any seen state) from INBOX within `hours`.
+
+    dedicated=True opens its OWN connection (logout on exit) instead of
+    the cached one. Background jobs (world-state brief) must use this:
+    the cached connection's lock is held for the whole IMAP operation,
+    so a background refresh on it would make a user's email question
+    queue behind ambient work for up to the socket timeout. The ~300ms
+    TLS+LOGIN cost is invisible off the hot path.
+    """
     from imap_tools import AND
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).date()
     messages: List[EmailSummary] = []
-    with _connect() as mailbox:
+
+    def _fetch(mailbox) -> None:
         # mark_seen=False keeps the SEEN flag untouched. reverse=True
         # gets newest first; bulk=True batches FETCHes for speed.
         for msg in mailbox.fetch(
@@ -137,6 +203,19 @@ def fetch_recent(hours: int = 24, max_messages: int = 20) -> List[EmailSummary]:
                 ))
             except Exception as e:
                 logger.debug("[icloud_email] msg parse failed: %s", e)
+
+    if dedicated:
+        mailbox = _connect()
+        try:
+            _fetch(mailbox)
+        finally:
+            try:
+                mailbox.logout()
+            except Exception:
+                pass
+    else:
+        with _mailbox() as mailbox:
+            _fetch(mailbox)
     return messages
 
 
@@ -155,7 +234,7 @@ def search_messages(
         return []
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).date()
     results: List[EmailSummary] = []
-    with _connect() as mailbox:
+    with _mailbox() as mailbox:
         # Server-side filter on subject OR from — fast.
         for msg in mailbox.fetch(
             criteria=AND(
@@ -214,7 +293,7 @@ def read_full(uid: str) -> Optional[dict]:
     """Get the full body of one message by UID. Returns
     {from, subject, date, body} or None if not found."""
     from imap_tools import AND
-    with _connect() as mailbox:
+    with _mailbox() as mailbox:
         for msg in mailbox.fetch(
             criteria=AND(uid=uid),
             mark_seen=False,
@@ -236,11 +315,15 @@ def read_full(uid: str) -> Optional[dict]:
 
 
 def summarize_inbox(args: dict) -> str:
-    """Tool: summarize recent inbox. Args: hours (default 24), max (default 20)."""
+    """Tool: summarize recent inbox. Args: hours (default 24), max (default 20),
+    dedicated (background callers only — own connection, no shared lock)."""
     hours = int(args.get("hours", 24) or 24)
     max_messages = int(args.get("max", 20) or 20)
+    dedicated = bool(args.get("dedicated", False))
     try:
-        msgs = fetch_recent(hours=hours, max_messages=max_messages)
+        msgs = fetch_recent(
+            hours=hours, max_messages=max_messages, dedicated=dedicated,
+        )
     except Exception as e:
         return f"Email unavailable: {e}"
     if not msgs:

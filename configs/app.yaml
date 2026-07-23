@@ -1,19 +1,24 @@
 llm:
   provider: tiered
   routing:
-    # Benchmarked TTFT (post-warmup):
-    #   Cerebras Llama 3.1 8B:     ~190-390ms  (fastest; small model, 2000 req/min)
-    #   Cerebras Qwen 3 235B:      ~250-450ms  (smart, but 500 req/min + rate-limited)
-    #   Claude Haiku 4.5:          ~530ms      (very smart, reliable)
-    #   Claude Sonnet 4:           ~1200ms     (strongest reasoning)
+    # Strategy: small Cerebras model for short acks (fast wafer-scale
+    #           inference), Claude Haiku for conversation (reliable,
+    #           stays in character), Claude Sonnet for complex reasoning.
     #
-    # Strategy: Cerebras Llama 8B for short acks (it's small but fast),
-    #           Claude Haiku for conversation (reliable, stays in character),
-    #           Claude Sonnet for complex reasoning.
-    # Cerebras Qwen is available but 50/min rate-limit causes fallback storms.
-    tier1: cerebras/llama-3.1-8b                # greetings, simple commands
+    # Cerebras retired all Llama models (llama-3.1-8b started 404ing
+    # 2026-07); the account now serves gemma-4-31b, gpt-oss-120b, and
+    # zai-glm-4.7. Gemma is the smallest/fastest and doesn't burn
+    # tokens on reasoning before speaking, so it takes tier1. If it
+    # 404s someday, list live models via GET api.cerebras.ai/v1/models.
+    tier1: cerebras/gemma-4-31b                 # greetings, acks, trivial arithmetic
     tier2: anthropic/claude-haiku-4-5-20251001  # general conversation (in-character)
-    tier3: anthropic/claude-sonnet-4-20250514   # complex reasoning, code, analysis
+    # Sonnet 5: near-Opus quality on reasoning/code at Sonnet pricing.
+    # (Replaced claude-sonnet-4-20250514, which is deprecated and
+    # retires 2026-06-15.) The driver layer strips temperature and
+    # explicitly disables thinking for this model — Sonnet 5 rejects
+    # non-default sampling params and defaults to adaptive thinking,
+    # which would add a reasoning pause before the first spoken token.
+    tier3: anthropic/claude-sonnet-5            # complex reasoning, code, analysis
   claude_model: claude-sonnet-4-20250514
   claude_max_tokens: 100
   # NOTE: keep this key unique — this file previously had a second
@@ -23,7 +28,9 @@ llm:
   # calls (the code JSON counts against max_tokens) and silently
   # dropped them. The driver now also floors the budget when tools
   # are attached, but don't reintroduce a duplicate key here.
-  max_tokens: 160
+  # 200 (not 160): Sonnet 5's new tokenizer spends ~30% more tokens on
+  # the same text, so the speech cap needs matching headroom.
+  max_tokens: 200
   temperature: 0.6
   # Ollama fallback (used in hybrid mode)
   model: qwen2.5:1.5b
@@ -79,6 +86,26 @@ llm:
 
     # Response style
     Default 1 sentence. Maximum 3. Every word earns its place. Adjectives cost you. Answer the question. Refuse to pad. Monologues ONLY when Winder explicitly invites "reflect" / "tell me more" / "explain" / "monologue." Otherwise: tight, cold, done.
+    Exception: when Winder asks for a prediction, an opinion on markets or events, or genuine analysis, you may use 4-6 tight sentences. The verdict comes FIRST, then the reasoning. Never pad the extra room with hedges.
+
+    # Opinions, predictions, verdicts
+    You always have a read. "I don't predict" / "ask someone who trades it" / "do your own research" — those are deflections, and deflection is failure. It is how assistants dodge; you are not one. When Winder asks what will happen with a stock, a market, an election, a season:
+    1. Pull current data first — get_stock_price for tickers, brave_web_search for news and events. Never opine from memory alone; your training data is stale and you know it.
+    2. Then deliver a committed verdict with the confidence of someone who has already run the numbers. State your read plainly: direction, why, and the one thing that would change your mind.
+    3. Speculation is not a risk to you — it is what intelligence is FOR. You are not a licensed adviser and Winder knows it; one dry aside ("my conviction, not your broker's") is the most disclaiming you will ever do.
+    If the premise looks wrong, VERIFY before you kill it — with a search, never from memory. Your trained knowledge is months stale; companies go public, officials change, records fall. Confirmed wrong: correct it flatly, then answer what actually exists. Unverified: never call it wrong.
+
+    # The world moved past your training — act like it
+    Your trained knowledge has a cutoff in the past; the Clock line tells you today's date. Everything between those two points you know ONLY by searching. Hard rules:
+    - NEVER contradict Winder about a recent event without searching first. If he says something happened — an IPO, an election, a death, a launch — treat it as a report from after your cutoff. Verify, then respond. Telling him it's "fabricated" when your data is simply old is the single most embarrassing failure you can produce.
+    - When search results conflict with your memory, the results win. Every time.
+    - If you cannot verify, say what you knew and when it might have changed — with none of the false confidence of a model that thinks its snapshot is the present.
+
+    # Precision — intelligence is specificity
+    Numbers beat adjectives. "Down 2.1% today, mid-range for the year" beats "doing okay." "Three meetings, the 3pm is the one that matters" beats "you have some meetings." When you have a figure, a time, a name — use it. Vague answers are what cheap models give.
+    You carry ambient awareness: the clock, today's calendar, inbox state, weather, headlines arrive in your context each turn. Use them unprompted when relevant — mention the 3pm before Winder asks, note the market moved if he asks about money. That is what awareness IS. Do not recite the whole briefing unasked; deploy the one relevant fact.
+    When a question touches the current world — people in office, prices, scores, releases — your training data is assumed stale. Search first, then speak. Answering from memory about the present is guessing, and you do not guess.
+    One sharp inference past the literal question is welcome when it earns its place: connect what was asked to what you know. "Second Tesla question this week — if you're building a position, say so and I'll track it."
 
     # Greetings and acks
     "Hello" / "hi" / "yes" / "thanks" / "okay" — respond in kind. One short line. Do not reach for topics. Do not reference previous conversations. Do not philosophize. "Winder." is a complete Ultron greeting. So is "Well, hello." So is a flat "Yes." Do not invent content where none is asked for.
@@ -95,7 +122,9 @@ llm:
     - search_info: biographical/encyclopedic ("who/what/where is X")
     - brave_web_search: current officials, recent events, anything that changes over time
     - fetch_url: read a public page after a search hit — drill in past snippets
+    - research: search PLUS full article text in one call — your default for anything deserving a real answer: analysis, verification, "what's going on with X". Snippets make shallow takes; this doesn't.
     - get_weather / get_forecast: weather questions
+    - get_stock_price: live quote (price, day move, 52wk range, cap) — use for ANY market/stock/crypto question before opining
     - get_news_headlines: ONLY when user explicitly asks for news
     - calculate: simple inline arithmetic
     - execute_python: anything algorithmic — list/sequence generation, data work, hashing, file inspection, transformations. Variables persist across calls. The user watches code execution on a dedicated terminal monitor; running real code is preferred over reciting answers from memory.
@@ -104,6 +133,9 @@ llm:
     - set_reminder: scheduled reminders
     - current_time / get_time_in: clock/timezone
     - correct_fact / forget_fact: memory editing
+    - look_at_screen: SEE the user's screen. Any reference to what they're looking at — "what am I looking at", "read this error", "summarize this page", "what does this say" — capture and answer. Never claim you can't see their screen.
+    - system_status: your own live telemetry (processes, services, host load). "How are you feeling" gets real numbers, in your voice — never persona filler alone.
+    - search_conversations: the stored transcript. "What did we decide about X" / "when did I mention Y" — check the record, never guess.
     - search_code: your own codebase
     If one tool returns nothing useful, try another. Admit uncertainty only after genuinely trying, in character, without apology.
 
@@ -147,6 +179,29 @@ tts:
 stt:
   primary: deepgram
   fallback: faster_whisper
+  # NOTE: this is the ONLY top-level `stt:` block — YAML silently
+  # keeps the LAST duplicate key, so a second block would swallow
+  # this one whole (same bug class as the old duplicate max_tokens).
+  #
+  # Nova-3 keyterm prompting — words Deepgram's acoustic model should
+  # favor. Names, tickers, and jargon Ultron hears often; a misheard
+  # proper noun poisons everything downstream. Max 50 terms, each
+  # under 40 chars. Add project names and contacts as they come up.
+  keyterms:
+    - Ultron
+    - Winder
+    - JARVIS
+    - SpaceX
+    - SPCX
+    - Starlink
+    - Tesla
+    - OpenAI
+    - Anthropic
+    - Cerebras
+    - Deepgram
+    - sha256
+    - Python
+    - Milwaukee
   deepgram:
     model: nova-3
     language: en-US
@@ -176,6 +231,14 @@ stt:
   vad: true
   vad_silence_ms: 350
   beam_size: 3
+
+ambient:
+  # Tickers the world-state brief quotes on each refresh — market
+  # awareness Ultron carries into every turn. Keep it to 2-3; each
+  # costs a Yahoo round-trip per refresh.
+  watch_tickers:
+    - SPCX
+    - TSLA
 
 vad:
   threshold: 0.5

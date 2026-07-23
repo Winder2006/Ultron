@@ -360,6 +360,41 @@ function playAudioFromBase64(b64: string) {
   processAudioQueue();
 }
 
+// ── Adaptive endpointing ──
+// The VAD's silence window is the single largest fixed delay at the end
+// of every turn. A flat 700ms is tuned for the worst case (speaker
+// pausing mid-sentence); when the live transcript already reads as a
+// complete utterance we can stop sooner, and when it clearly trails
+// off mid-clause we should wait longer.
+const VAD_SILENCE_DEFAULT_MS = 700;
+
+// Words that signal the speaker is mid-clause — if the interim
+// transcript ends on one of these, they're almost certainly not done.
+const TRAILING_INCOMPLETE = new Set([
+  'and', 'or', 'but', 'so', 'the', 'a', 'an', 'to', 'of', 'in', 'on',
+  'at', 'for', 'with', 'my', 'your', 'his', 'her', 'their', 'its',
+  'is', 'are', 'was', 'were', 'if', 'then', 'that', 'what', 'whats',
+  'how', 'who', 'when', 'where', 'why', 'uh', 'um', 'plus', 'minus',
+  'times', 'versus', 'about', 'from', 'by', 'as', 'than',
+]);
+
+function silenceMsForTranscript(text: string): number {
+  const t = text.trim();
+  if (!t) return VAD_SILENCE_DEFAULT_MS;
+  const words = t.toLowerCase().replace(/[.,!?]+$/, '').split(/\s+/);
+  if (words.length < 3) return VAD_SILENCE_DEFAULT_MS;
+  const last = words[words.length - 1];
+  if (TRAILING_INCOMPLETE.has(last)) return 850;  // clearly mid-clause
+  // Floor at 550/650 (not 450/550): the backend dispatches only 250ms
+  // after our end-of-speech signal, and Deepgram punctuates interims
+  // at natural breath pauses. 450ms + 250ms stacked was cutting off
+  // multi-sentence utterances mid-thought ("Search for Tesla news."
+  // <breath> "...from this week") — the two margins must not both be
+  // aggressive at once.
+  if (/[.!?]$/.test(t)) return 550;               // Deepgram punctuated it — done
+  return 650;                                     // plausible complete clause
+}
+
 export function useVoice() {
   const [state, setState] = useState<VoiceState>({
     connected: false,
@@ -394,6 +429,12 @@ export function useVoice() {
         case 'stt': {
           const text = (event.text as string) || '';
           updates.transcript = text;
+          if (!event.final) {
+            // Adaptive endpointing: tune the VAD's silence window to
+            // how complete the live transcript looks. No-op when no
+            // VAD is active (push-to-talk).
+            vadRef.current?.setSilenceDurationMs(silenceMsForTranscript(text));
+          }
           if (event.final) {
             if (text.trim()) {
               // Got a transcript — backend is now generating a response
@@ -560,7 +601,10 @@ export function useVoice() {
           speechThreshold: 0.5,
           silenceDurationMs: 700,  // stop 700ms after last speech
           minSpeechMs: 250,        // require at least 250ms of speech
-          maxDurationMs: 10000,    // 10s hard ceiling
+          // 45s ceiling: the VAD's silence detection ends normal turns;
+          // this only caps runaway noise. The old 10s cap cut off long
+          // questions while the user was mid-sentence.
+          maxDurationMs: 45000,
           onEndOfSpeech: wrappedCallback,
         });
       } else {
@@ -574,6 +618,9 @@ export function useVoice() {
         console.warn('[vad] load failed, auto-stop on silence disabled:', err);
       });
       vad.reset();
+      // Fresh turn — restore the default silence window; the previous
+      // turn's adaptive adjustment must not leak into this one.
+      vad.setSilenceDurationMs(VAD_SILENCE_DEFAULT_MS);
     }
 
     try {

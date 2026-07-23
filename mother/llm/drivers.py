@@ -165,8 +165,19 @@ class HybridLLMDriver(LLMDriver):
 TIER_MODELS = {
     "tier1": "gemini/gemini-2.5-flash-lite",
     "tier2": "groq/llama-3.3-70b-versatile",
-    "tier3": "anthropic/claude-sonnet-4-20250514",
+    "tier3": "anthropic/claude-sonnet-5",
 }
+
+# Anthropic models with the stricter 2026 API surface: non-default
+# sampling params (temperature/top_p/top_k) return a 400, and thinking
+# runs ADAPTIVE by default when the `thinking` field is omitted. For a
+# voice assistant both are wrong — temperature would kill the request
+# outright, and implicit thinking inserts a silent reasoning pass
+# before the first audible token. We strip sampling and explicitly
+# disable thinking for these models. (Do NOT add claude-fable models
+# here without changing the thinking handling — Fable rejects an
+# explicit "disabled" and requires the field to be omitted.)
+_STRICT_SAMPLING_MODELS = ("claude-sonnet-5", "claude-opus-4-7", "claude-opus-4-8")
 
 
 class TieredLLMDriver(LLMDriver):
@@ -247,6 +258,12 @@ class TieredLLMDriver(LLMDriver):
         # still keeps plain speech short.
         if tools and tier in ("tier2", "tier3"):
             tok = max(tok, 1024)
+        elif tier == "tier3":
+            # Toolless tier3 turns are the analysis/verdict lane — the
+            # persona authorizes 4-6 sentences there, which the global
+            # speech cap (200) squeezes. Floor, don't replace: an
+            # explicit larger budget still wins.
+            tok = max(tok, 300)
 
         # Build messages in OpenAI format. For Anthropic tiers, mark
         # the FIRST system message as cacheable — Claude's prompt
@@ -308,6 +325,23 @@ class TieredLLMDriver(LLMDriver):
         elif api_messages and api_messages[0]["role"] not in ("system", "user"):
             api_messages.insert(0, {"role": "user", "content": "Hello."})
 
+        # ── Moving history breakpoint (Anthropic) ──
+        # The system-prompt and tool breakpoints below cache the STATIC
+        # prefix, but conversation history was re-processed as uncached
+        # input every turn — at 20 exchanges that's a permanent ~2-3K
+        # token + 50-150ms tax per turn. Marking the LAST message
+        # cacheable makes the next request's prefix (same history + two
+        # new messages) hit the cache up to this point. Anthropic allows
+        # 4 breakpoints; this is the third.
+        if is_anthropic and api_messages:
+            last = api_messages[-1]
+            if last["role"] != "system" and isinstance(last.get("content"), str):
+                last["content"] = [{
+                    "type": "text",
+                    "text": last["content"],
+                    "cache_control": {"type": "ephemeral"},
+                }]
+
         kwargs: Dict = {
             "model": model,
             "messages": api_messages,
@@ -315,6 +349,11 @@ class TieredLLMDriver(LLMDriver):
             "max_tokens": tok,
             "stream": True,
         }
+        if any(m in model for m in _STRICT_SAMPLING_MODELS):
+            # See _STRICT_SAMPLING_MODELS: temperature 400s, and omitting
+            # `thinking` silently enables adaptive thinking (latency).
+            kwargs.pop("temperature", None)
+            kwargs["thinking"] = {"type": "disabled"}
 
         # LiteLLM handles tools natively for providers that support it
         if tools and tier in ("tier2", "tier3"):
@@ -339,6 +378,14 @@ class TieredLLMDriver(LLMDriver):
                     last["cache_control"] = {"type": "ephemeral"}
                     oai_tools = oai_tools[:-1] + [last]
                 kwargs["tools"] = oai_tools
+
+        # Forced tool choice (extra={"tool_choice": {...}}) — used for
+        # compute-style queries that MUST run code even when the answer
+        # already sits in the conversation history. Only meaningful when
+        # tools made it into the request (so a fallback to a toolless
+        # tier drops the constraint instead of erroring).
+        if extra and extra.get("tool_choice") and "tools" in kwargs:
+            kwargs["tool_choice"] = extra["tool_choice"]
 
         try:
             response = litellm.completion(**kwargs)
@@ -422,9 +469,17 @@ class TieredLLMDriver(LLMDriver):
             # tier is visited at most once before we re-raise.
             import logging
             _log = logging.getLogger("mother.llm")
+            # Prefer cheaper/faster tiers below the failing one, but
+            # ALSO escalate upward when nothing sits below — otherwise
+            # a tier1 provider outage (e.g. Cerebras retiring a model)
+            # yields silence instead of a slightly slower Haiku answer.
             fallback_order = ["tier3", "tier2", "tier1"]
             current_idx = fallback_order.index(tier) if tier in fallback_order else -1
-            for fb_tier in fallback_order[current_idx + 1:]:
+            candidates = (
+                fallback_order[current_idx + 1:]
+                + list(reversed(fallback_order[:max(current_idx, 0)]))
+            )
+            for fb_tier in candidates:
                 if fb_tier in attempted:
                     continue
                 if fb_tier not in self._models:

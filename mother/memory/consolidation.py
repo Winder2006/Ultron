@@ -25,6 +25,7 @@ JSON-file granularity, holding the per-user episodic lock).
 """
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import re
@@ -251,22 +252,36 @@ def consolidate_user(
         # Call the LLM. We accept either a plain `chat`-style fn or the
         # full driver.stream_chat result joined; signature is callable
         # returning a string.
+        def _call_llm() -> str:
+            try:
+                return llm_fn(messages, max_tokens=600)
+            except TypeError:
+                # Some shapes don't take max_tokens kwarg
+                return llm_fn(messages)
+
+        # Run in a worker thread so LLM_TIMEOUT_S is actually enforced —
+        # a hung llm_fn would otherwise hold _run_lock forever and stall
+        # consolidation for every user. On timeout the abandoned worker
+        # thread may linger until the underlying call returns; that's
+        # acceptable, we release the lock and skip this batch.
         t0 = now_fn()
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
-            raw = llm_fn(messages, max_tokens=600)
-        except TypeError:
-            # Some shapes don't take max_tokens kwarg
-            raw = llm_fn(messages)
+            raw = executor.submit(_call_llm).result(timeout=LLM_TIMEOUT_S)
+        except concurrent.futures.TimeoutError:
+            summary["error"] = f"LLM timed out after {LLM_TIMEOUT_S:.0f}s"
+            logger.warning(
+                "[consolidation] user=%s LLM call exceeded %.0fs budget — skipping batch",
+                user_id, LLM_TIMEOUT_S,
+            )
+            return summary
         except Exception as e:
             summary["error"] = f"LLM error: {e}"
             return summary
+        finally:
+            # wait=False: don't block on a possibly-hung worker.
+            executor.shutdown(wait=False)
         elapsed = now_fn() - t0
-
-        if elapsed > LLM_TIMEOUT_S:
-            logger.warning(
-                "[consolidation] user=%s LLM call took %.1fs (>%ds budget) — using anyway",
-                user_id, elapsed, LLM_TIMEOUT_S,
-            )
 
         plan = _extract_json_object(raw or "")
         if not plan or not isinstance(plan, dict):
@@ -361,21 +376,23 @@ def consolidate_user(
                 # Only drop if the fresh list still has those entries
                 # at those indices (no concurrent mutation). Be
                 # defensive: filter rather than index-delete.
-                kept = [
-                    m for i, m in enumerate(fresh)
-                    if i not in drop_global
-                ]
-                # Tag remaining survivors that were considered as
-                # consolidated so the next pass skips them.
+                # Tag considered survivors as consolidated BEFORE
+                # compaction: consolidated_indices are positions in the
+                # pre-filter `fresh` list, and positions shift once
+                # dropped entries are removed.
                 consolidated_indices = {
-                    g for g in [local_to_global[l] for l in local_to_global]
+                    g for g in local_to_global.values()
                     if g not in drop_global
                 }
-                for i, m in enumerate(kept):
+                for i, m in enumerate(fresh):
                     if i in consolidated_indices:
                         m.setdefault("tags", [])
                         if "_consolidated" not in m["tags"]:
                             m["tags"].append("_consolidated")
+                kept = [
+                    m for i, m in enumerate(fresh)
+                    if i not in drop_global
+                ]
                 mem._save_episodic(kept)
                 # Invalidate the embedding cache — text set changed.
                 mem._ep_emb_cache = None

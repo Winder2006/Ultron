@@ -46,6 +46,12 @@ TIER3_TRIGGERS = [
     "what are the implications", "break down",
     "create a plan", "design", "architect",
     "translate", "calculate",
+    # Opinion/reasoning shapes that deserve the strong model when the
+    # question is substantial (the >=8 word gate below still applies,
+    # so "why not" or a short "what do you think" stays on Haiku).
+    "what do you think", "your opinion", "your take",
+    "why is", "why does", "why do", "why did", "why would",
+    "how should", "what would happen",
 ]
 
 # Patterns that signal simple/short queries → tier1.
@@ -82,6 +88,83 @@ COMPUTE_HINTS = re.compile(
     re.I,
 )
 
+# Speculative questions about volatile topics ("what's gonna happen
+# with SpaceX stock?", "who will win the election?") need BOTH signals:
+# a predictive/opinion verb AND a topic that actually moves. Requiring
+# the pair keeps persona questions ("what do you think of humanity?")
+# and command phrasing ("will you remind me...") out of this bucket.
+# Matches route to tier3 (a committed prediction is real reasoning) and
+# the voice route forces a web search first so the take is grounded in
+# this week's facts, not training data.
+# "will(?!\s+you)" — "will you remind me / will you check" is a
+# request TO the assistant, not a prediction. "should i" alone matched
+# "should I bring a jacket to the game" (with 'game' as the volatile
+# topic), forcing a web research call on a wardrobe question — so it
+# now requires a trade-flavored verb.
+PREDICTIVE_HINTS = re.compile(
+    r"\b(gonna|going to|will(?!\s+you\b)|predict|prediction|forecast|"
+    r"expect|should i (?:buy|sell|invest|short|bet)|"
+    r"what do you think|your (?:take|opinion|read|call)|"
+    r"odds|chances|likely|bet)\b",
+    re.I,
+)
+VOLATILE_TOPIC_HINTS = re.compile(
+    r"\b(stocks?|shares?|share price|markets?|trading|invest(?:ing|ment)?|"
+    r"crypto|bitcoin|btc|ethereum|price|valuation|ipo|merger|acquisition|"
+    r"earnings|fed|interest rates?|inflation|recession|economy|"
+    r"election|polls?|game|match|series|season|playoffs?|championship)\b",
+    re.I,
+)
+
+
+def is_speculative(query: str) -> bool:
+    """True when the query asks for a prediction/opinion on a volatile topic."""
+    return bool(
+        PREDICTIVE_HINTS.search(query) and VOLATILE_TOPIC_HINTS.search(query)
+    )
+
+
+# User assertions about recent events ("SpaceX just had their IPO",
+# "did you hear X died?"). The model's training snapshot predates the
+# conversation, so contradicting these from memory produces confident
+# nonsense — the observed case: flatly telling the user a completed
+# IPO was "fabricated". A match forces a verification web search
+# before the model may agree or disagree.
+#
+# TWO signals required, like is_speculative: a claim marker alone
+# ("i saw...", "did you know...", "apparently...") fires on everyday
+# small talk ("I saw a great movie last night"), which forced a
+# pointless search AND armed the correct_fact instruction to write
+# junk into permanent memory. The claim marker must co-occur with a
+# newsworthy-event topic (or a volatile topic from the list above).
+NEWS_CLAIM_HINTS = re.compile(
+    r"\b(just (?:had|happened|announced|launched|released|dropped|"
+    r"died|won|lost|ipo'?d|went public|got|became)|"
+    r"did you (?:hear|see|know)|i (?:heard|read|saw)|apparently|"
+    r"breaking|(?:is|are|went) (?:now|officially) |went public|"
+    r"had (?:their|its|his|her) (?:ipo|launch|release|election)|"
+    r"(?:is|are) (?:a )?public(?:ly traded)? compan)",
+    re.I,
+)
+NEWS_EVENT_TOPICS = re.compile(
+    r"\b(ipo|public(?:ly traded)?|launch(?:ed)?|release[ds]?|"
+    r"announc(?:ed|ement)|died|death|dead|passed away|won|lost|"
+    r"elect(?:ed|ion)|resign(?:ed)?|acquir(?:ed|es|ing)|merg(?:ed|er)|"
+    r"bankrupt(?:cy)?|crash(?:ed)?|record (?:high|low)|all.time high|"
+    r"war|ceasefire|indicted?|arrested|hacked|breach(?:ed)?|"
+    r"ceo|president|prime minister)\b",
+    re.I,
+)
+
+
+def is_news_claim(query: str) -> bool:
+    """True when the user asserts/reports a possibly-recent public event."""
+    if not NEWS_CLAIM_HINTS.search(query):
+        return False
+    return bool(
+        NEWS_EVENT_TOPICS.search(query) or VOLATILE_TOPIC_HINTS.search(query)
+    )
+
 
 def classify_complexity(query: str, intent: str = "GENERAL") -> Tier:
     """Classify query complexity into a routing tier.
@@ -104,15 +187,24 @@ def classify_complexity(query: str, intent: str = "GENERAL") -> Tier:
     # Compute-flavored queries are exempt from the shortcut: tier1
     # has no tools, so routing "factorial of twenty" there means the
     # answer gets recited instead of executed.
+    #
+    # NOTE: tier1 is PATTERN-matched only. There used to be a generic
+    # "any query of <=3 words" rule here, which sent real questions
+    # ("who's Kant?", "define entropy") to the 8B model for mediocre
+    # answers. Greetings, acks, media commands, and trivial arithmetic
+    # are what tier1 is for; everything else earns Haiku's ~300ms.
     needs_compute = bool(COMPUTE_HINTS.search(q_lower))
-    if word_count <= 5 and not needs_compute:
+    if word_count <= 6 and not needs_compute:
         for pat in TIER1_PATTERNS:
             if pat.search(q):
                 return "tier1"
-        if word_count <= 3:
-            return "tier1"
 
     # --- Tier 3: genuine reasoning work ---
+
+    # Predictions/opinions on volatile topics: a committed, grounded
+    # take is exactly what the strongest model is for.
+    if is_speculative(q_lower):
+        return "tier3"
 
     # Long queries almost always need real reasoning
     if word_count > 50:

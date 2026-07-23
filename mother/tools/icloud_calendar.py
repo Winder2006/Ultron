@@ -38,6 +38,9 @@ logger = logging.getLogger("mother.tools.icloud_calendar")
 
 ICLOUD_CALDAV_URL = "https://caldav.icloud.com"
 _PRINCIPAL_CACHE_TTL_S = 3600.0  # re-do calendar discovery hourly
+# Per-request timeout passed through DAVClient to the HTTP layer.
+# Without it a dead network hangs the worker thread indefinitely.
+_CALDAV_TIMEOUT_S = 15
 
 
 # ─────────────────────── data shapes ───────────────────────────────
@@ -121,6 +124,7 @@ def _ensure_principal():
             url=ICLOUD_CALDAV_URL,
             username=user,
             password=pw,
+            timeout=_CALDAV_TIMEOUT_S,
         )
         principal = client.principal()
         calendars = principal.calendars()

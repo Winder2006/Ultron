@@ -130,6 +130,16 @@ export class RecordingVAD {
   }
 
   /**
+   * Adjust the end-of-speech silence window on the fly. Used for
+   * adaptive endpointing: the live transcript tells us whether the
+   * utterance already reads as complete (stop sooner) or trails off
+   * mid-clause (wait longer). Takes effect on the next frame.
+   */
+  setSilenceDurationMs(ms: number): void {
+    this.silenceThresholdMs = ms;
+  }
+
+  /**
    * Swap the end-of-speech callback without rebuilding the model.
    * Lets the caller reuse a loaded RecordingVAD across recordings even
    * when the React closure identity changes — otherwise we'd

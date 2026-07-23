@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+from datetime import datetime
 import json
 import queue
 import re
@@ -94,6 +95,58 @@ async def _send_event(ws: WebSocket, event: dict):
         logger.warning("send_json failed (event=%s): %s", event.get("event"), e)
 
 
+# ── Anthropic prompt-cache keep-warm ──
+# The prompt cache (tools schema + static persona, ~10-15KB) has a
+# 5-minute TTL. After any idle gap the first turn re-processes the
+# whole prefix — an extra 300-500ms of TTFT exactly when the user
+# comes back. Cure: when a turn *starts* (recording begins / prompt
+# arrives) and the cache is likely cold, fire a 1-token warm request
+# that rebuilds the tier-2 cache entry in parallel with STT. It uses
+# the same message-building path as real calls, so the prefix bytes
+# (and therefore the cache key) match exactly. Cost per warm: one
+# output token + cache-write pricing on the prefix.
+_LLM_WARM_STATE = {"last_activity": 0.0}
+CACHE_WARM_INTERVAL_S = 240.0  # under the 5-min TTL with margin
+
+
+def _maybe_warm_llm_cache(llm, cfg) -> None:
+    """Fire-and-forget cache warm-up if no LLM call happened recently."""
+    now = time.monotonic()
+    if now - _LLM_WARM_STATE["last_activity"] < CACHE_WARM_INTERVAL_S:
+        return
+
+    from mother.llm.drivers import ChatMessage, TieredLLMDriver
+    if not isinstance(llm, TieredLLMDriver):
+        # Don't stamp: a non-tiered driver never warms the Anthropic
+        # cache, so burning the 240s budget here just disabled retries.
+        return
+    _LLM_WARM_STATE["last_activity"] = now
+
+    def _warm():
+        try:
+            from mother.llm.tools import TOOLS_SCHEMA
+            msgs = [
+                ChatMessage(
+                    role="system",
+                    content=cfg.llm.system_prompt if cfg else "You are ULTRON.",
+                ),
+                ChatMessage(role="user", content="ok"),
+            ]
+            t0 = time.monotonic()
+            for _ in llm.stream_chat(
+                msgs, max_tokens=1, tools=TOOLS_SCHEMA, tier="tier2",
+            ):
+                pass
+            logger.info(
+                "[cache_warm] tier2 prefix warmed in %.2fs",
+                time.monotonic() - t0,
+            )
+        except Exception as e:
+            logger.debug("[cache_warm] failed: %s", e)
+
+    threading.Thread(target=_warm, daemon=True, name="llm-cache-warm").start()
+
+
 def _run_speaker_id(audio: np.ndarray, sr: int) -> tuple[Optional[str], float]:
     """Run speaker identification (blocking — call from thread)."""
     try:
@@ -137,6 +190,25 @@ def _synthesize_to_b64(tts, text: str) -> tuple[Optional[str], int]:
     return None, 0
 
 
+# Long raw literals (hex digests, base64 blobs, opaque IDs) in speech.
+# Applied to code-turn narration only: the full value is already on
+# screen in the exec window, and even with an explicit instruction the
+# model reliably "helps" by reading the value anyway — so the redaction
+# is enforced in code, not prompted.
+# Second alternative: no '-'/'_' in the class (hyphenated word chains
+# like "state-of-the-art-looking" are speech, not blobs) and require at
+# least one digit — real base64/IDs virtually always carry digits;
+# 24+ char pure-letter runs are words.
+_LONG_LITERAL_RE = re.compile(
+    r"\b[0-9a-fA-F]{12,}\b|\b(?=[A-Za-z0-9+/=]*\d)[A-Za-z0-9+/=]{24,}\b"
+)
+
+
+def _redact_long_literals(text: str) -> str:
+    """Truncate long raw literals to an 8-char prefix + ellipsis."""
+    return _LONG_LITERAL_RE.sub(lambda m: m.group(0)[:8] + "…", text)
+
+
 async def _dispatch_execute_python(
     tool_args: dict,
     *,
@@ -159,10 +231,12 @@ async def _dispatch_execute_python(
     from mother.tools.code_exec import (
         execute_python_full, restore_session_state,
     )
-    # First exec of this WS session — restore any pickled namespace
-    # from the previous session so variables survive reconnects.
-    if current_user is not None and not turn_state.get("repl_state_loaded"):
-        turn_state["repl_state_loaded"] = True
+    # First exec for THIS user in this WS session — restore their
+    # pickled namespace so variables survive reconnects. Keyed by user
+    # id (not a boolean): if voice ID reassigns the session to a
+    # different speaker mid-connection, their state still loads.
+    if current_user is not None and turn_state.get("repl_state_user") != current_user.user_id:
+        turn_state["repl_state_user"] = current_user.user_id
         try:
             res = await asyncio.to_thread(
                 restore_session_state, id(ws), current_user.user_id,
@@ -308,7 +382,7 @@ async def voice_websocket(ws: WebSocket):
     # task is also tracked so we can cancel it explicitly. The flag is
     # cleared at the start of each new turn.
     cancel_event = asyncio.Event()
-    turn_state: dict = {"current_turn_task": None, "repl_state_loaded": False}
+    turn_state: dict = {"current_turn_task": None, "repl_state_user": None}
     ws.state.cancel_event = cancel_event  # type: ignore[attr-defined]
     ws.state.turn_state = turn_state  # type: ignore[attr-defined]
 
@@ -478,6 +552,41 @@ async def voice_websocket(ws: WebSocket):
 
     _spawn(_idle_watcher())
 
+    # ── Pre-spawn the per-session Python REPL ──
+    # The first execute_python of a session otherwise pays subprocess
+    # spawn + interpreter boot + pickled-namespace restore (~300-800ms)
+    # right in the middle of answering. Boot it now, off the loop, while
+    # the connection is idle. Torn down with the WS like any REPL.
+    async def _prespawn_repl():
+        # Boot ONLY — no namespace restore here. At connect time the
+        # speaker hasn't been identified yet, so restoring for
+        # get_or_fallback_user() loaded the DEFAULT user's variables
+        # and marked state as restored; when voice ID later resolved a
+        # different user, their pickled namespace was silently skipped
+        # and the default user's variables leaked into their session.
+        # The subprocess boot (~300-800ms) is the expensive part; the
+        # per-user pickle restore (~50ms) happens on first exec, when
+        # the real user is known.
+        try:
+            from mother.tools.code_exec import get_or_create_repl
+
+            def _boot():
+                get_or_create_repl(id(ws)).warmup()
+
+            await asyncio.to_thread(_boot)
+        except Exception as e:
+            logger.debug("repl prespawn skipped: %s", e)
+
+    _spawn(_prespawn_repl())
+
+    # Warm the world-state brief at connect so the FIRST question of a
+    # session already has ambient awareness (daemon thread, no await).
+    try:
+        from mother.core import world_state
+        world_state.maybe_refresh_async()
+    except Exception:
+        pass
+
     # Live-streaming recording state:
     #   audio_queue    — PCM chunks being streamed to Deepgram in real-time
     #   audio_buffer   — same chunks kept as a backup for speaker ID + fallback STT
@@ -634,6 +743,11 @@ async def voice_websocket(ws: WebSocket):
                             target=_bg_tts_warmup, daemon=True,
                             name="tts-prewarm",
                         ).start()
+                    # Warm the Anthropic prompt cache in parallel with
+                    # the user's speech if it has likely gone cold —
+                    # the LLM call at end-of-utterance then hits a warm
+                    # prefix instead of paying full re-processing.
+                    _maybe_warm_llm_cache(llm, cfg)
                     is_recording = True
                     await _send_event(ws, {"event": "recording_started"})
 
@@ -702,34 +816,58 @@ async def voice_websocket(ws: WebSocket):
                             and interim_age > 0.20
                         )
                         # WS path with speech_final delivers finals in
-                        # ~100-300ms reliably. 700ms gives slow finals
-                        # a fair shot before falling back to REST.
-                        wait_timeout = 0.7
+                        # ~100-300ms reliably. When we HAVE a complete,
+                        # stable interim, give the final only a short
+                        # head start (250ms) before dispatching on the
+                        # interim — the browser VAD already confirmed
+                        # ~700ms of silence, so the interim is almost
+                        # always byte-identical to the coming final,
+                        # and the divergence telemetry below catches
+                        # the rare miss. Without a usable interim,
+                        # wait the full 700ms for the final.
+                        wait_timeout = 0.25 if is_complete_interim else 0.7
+
+                        # ── Join ALL finalized segments ──
+                        # Deepgram finalizes a segment at every ~300ms
+                        # pause (endpointing), so a long utterance with
+                        # natural breaths produces SEVERAL finals. Taking
+                        # only the first one silently discarded everything
+                        # after the first pause — the "I get cut off on
+                        # long questions" bug. Drain the pre-queued
+                        # segments, then wait briefly for the tail.
+                        _segments: list[str] = []
+                        while True:
+                            try:
+                                _seg = _spec_tq.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                            if _seg:
+                                _segments.append(_seg)
 
                         try:
-                            live_text = await asyncio.wait_for(
+                            _tail = await asyncio.wait_for(
                                 _spec_tq.get(), timeout=wait_timeout,
                             )
-                            transcript_source = "final"
-                            logger.info(
-                                "[TIMING] live_stt: waited=%.3fs (final) text=%r",
-                                time.monotonic() - t_wait, live_text[:60],
-                            )
+                            if _tail:
+                                _segments.append(_tail)
+                            if _segments:
+                                transcript_source = "final"
                         except asyncio.TimeoutError:
-                            if is_complete_interim:
-                                live_text = interim
-                                transcript_source = "interim"
-                                logger.info(
-                                    "[TIMING] live_stt: using interim after %.3fs "
-                                    "(stable=%d age=%.2fs words=%d) text=%r",
-                                    time.monotonic() - t_wait, stable,
-                                    interim_age, len(interim.split()),
-                                    interim[:60],
+                            # The tail segment never finalized. If the
+                            # current interim is complete and extends
+                            # past the finalized segments, append it.
+                            if is_complete_interim and interim not in _segments:
+                                _segments.append(interim)
+                                transcript_source = (
+                                    "interim" if len(_segments) == 1
+                                    else "final+interim"
                                 )
                                 _emit_event(event_bus, {
                                     "type": "stt_speculative",
-                                    "text": live_text[:80],
+                                    "text": interim[:80],
                                 })
+                            elif _segments:
+                                transcript_source = "final"
                             else:
                                 logger.warning(
                                     "Live STT timed out (interim=%r stable=%d "
@@ -738,6 +876,14 @@ async def voice_websocket(ws: WebSocket):
                                     stable,
                                     len(interim.split()) if interim else 0,
                                 )
+
+                        live_text = " ".join(_segments).strip()
+                        if live_text:
+                            logger.info(
+                                "[TIMING] live_stt: waited=%.3fs (%s, %d segment(s)) text=%r",
+                                time.monotonic() - t_wait, transcript_source,
+                                len(_segments), live_text[:80],
+                            )
 
                     # Reset interim-tracking state for next utterance.
                     stt_track["latest_interim"] = ""
@@ -752,11 +898,18 @@ async def voice_websocket(ws: WebSocket):
                     # task cleanup so the actual final still has time
                     # to arrive — we want to capture it for divergence
                     # telemetry without blocking the LLM dispatch.
-                    if transcript_source == "interim" and _spec_stt_task is not None:
+                    if (
+                        transcript_source in ("interim", "final+interim")
+                        and _spec_stt_task is not None
+                    ):
                         async def _capture_final_then_cleanup(
                             tq=_spec_tq,
                             task=_spec_stt_task,
-                            spec_text=live_text,
+                            # Compare the tail final against the interim
+                            # SEGMENT it replaced, not the whole joined
+                            # utterance — earlier segments are already
+                            # confirmed finals.
+                            spec_text=interim,
                         ):
                             try:
                                 final_text = await asyncio.wait_for(
@@ -1084,7 +1237,7 @@ async def _process_text_query(
     # Per-connection mutable state (barge-in, REPL restore tracking).
     # Stored on ws.state by voice_websocket; fall back to a plain dict
     # if called from a context that never set it (tests / fast-path).
-    turn_state: dict = getattr(ws.state, "turn_state", {"repl_state_loaded": False})
+    turn_state: dict = getattr(ws.state, "turn_state", {"repl_state_user": None})
 
     # Record activity for the ambient scheduler — this suppresses idle
     # observations for ~15 minutes after each real user turn.
@@ -1177,6 +1330,44 @@ async def _process_text_query(
     # cache_control to the first block only.
     system_prompt = cfg.llm.system_prompt if cfg else "You are ULTRON."
     dynamic_parts: list[str] = []
+
+    # Clock. Models have no idea what time it is, and the persona
+    # prompt advertises current_time/get_time_in — a combination that
+    # made the TOOLLESS tier1 model write "call:current_time{}" as
+    # literal text when asked the time. With the clock in context,
+    # every tier answers time/date questions directly, and date
+    # reasoning ("this Friday") stops being guesswork. Lives in the
+    # dynamic (uncached) block so it never busts the persona cache.
+    _now = datetime.now().astimezone()
+    dynamic_parts.append(
+        f"[Clock: it is {_now.strftime('%A, %B %d, %Y, %I:%M %p').replace(' 0', ' ')} "
+        f"({_now.tzname()}). Answer time/date questions from this directly. "
+        "Your trained knowledge ends BEFORE this date — events since your "
+        "cutoff are known to you only through tools. Never deny a recent "
+        "event from memory alone.]"
+    )
+    if tier == "tier1":
+        # tier1 runs WITHOUT tools attached. The persona's tool list
+        # still tempts small models into inventing textual call syntax
+        # ("call:current_time{}") — tell them plainly not to.
+        dynamic_parts.append(
+            "[No tools are attached to this turn. Answer directly from "
+            "what you know and the context above. Never write tool-call "
+            "syntax or tool names as text in your reply.]"
+        )
+
+    # World-state brief — pre-computed ambient awareness (calendar,
+    # inbox, weather, headlines). Injection is instant (cached text);
+    # the staleness kick refreshes it in a daemon thread for the NEXT
+    # turn, so the current one never waits on IMAP/CalDAV/RSS.
+    try:
+        from mother.core import world_state
+        _brief = world_state.get_brief()
+        if _brief:
+            dynamic_parts.append(_brief)
+        world_state.maybe_refresh_async()
+    except Exception:
+        pass
 
     # Inject vision context if available
     if has_vision:
@@ -1288,7 +1479,11 @@ async def _process_text_query(
             )
             _long_mem = get_long_memory(current_user.user_id)
             _t_long = time.monotonic()
-            long_hits = await asyncio.to_thread(_long_mem.search, text, k=3)
+            # k=5 (was 3): with the conversation prefix now genuinely
+            # prompt-cached, extra recall context is nearly free — and
+            # remembered specifics are the most visible form of
+            # awareness there is.
+            long_hits = await asyncio.to_thread(_long_mem.search, text, k=5)
             long_block = _fmt_long(long_hits)
             if long_block:
                 _emit_event(event_bus, {
@@ -1453,6 +1648,76 @@ async def _process_text_query(
         except Exception:
             _tools_for_call = None
 
+    # Compute-style queries MUST run code in the exec window — even
+    # when the answer (a hash, a factorial) already sits in the
+    # conversation history from a previous turn. Left on "auto" the
+    # model repeats the remembered value straight into chat ("I already
+    # gave you that one"), which is the exact recitation the exec view
+    # exists to prevent. Forced on the FIRST call only: the ReAct
+    # narration hops run unforced or they'd loop executing forever.
+    _first_call_extra = None
+    _news_claim_turn = False
+    if _tools_for_call is not None:
+        try:
+            from mother.llm.classifier import (
+                COMPUTE_HINTS, is_news_claim, is_speculative,
+            )
+            if is_news_claim(text.lower()):
+                # The user is reporting/asserting a recent event.
+                # Training data predates the conversation — verify
+                # before agreeing or (catastrophically) contradicting.
+                # The flag also arms the narration step to persist a
+                # confirmed correction to long-term memory.
+                _news_claim_turn = True
+                _first_call_extra = {
+                    "tool_choice": {
+                        "type": "function",
+                        "function": {"name": "brave_web_search"},
+                    }
+                }
+            elif COMPUTE_HINTS.search(text.lower()):
+                _first_call_extra = {
+                    "tool_choice": {
+                        "type": "function",
+                        "function": {"name": "execute_python"},
+                    }
+                }
+            elif is_speculative(text.lower()):
+                # Predictions/opinions on volatile topics: ground the
+                # take in this week's facts before the verdict. The
+                # one-shot research tool (search + full article text)
+                # beats bare snippets here — a committed market take
+                # deserves more than result blurbs.
+                _first_call_extra = {
+                    "tool_choice": {
+                        "type": "function",
+                        "function": {"name": "research"},
+                    }
+                }
+            elif getattr(intent, "name", "") == "INFO_SEARCH":
+                # Factual lookups always ground in a search hop rather
+                # than trusting training data. Time-sensitive phrasing
+                # goes to live web search; timeless facts take the
+                # faster encyclopedic path. Stale answers are the
+                # quickest way to look dumb; sourced ones the quickest
+                # way to look sharp.
+                _ts = re.search(
+                    r"\b(latest|today|current(?:ly)?|right now|recent|"
+                    r"news|this (?:week|month|year)|price|score|who is "
+                    r"the (?:president|ceo|prime minister|mayor|coach))\b",
+                    text, re.I,
+                )
+                _first_call_extra = {
+                    "tool_choice": {
+                        "type": "function",
+                        "function": {
+                            "name": "brave_web_search" if _ts else "search_info",
+                        },
+                    }
+                }
+        except Exception:
+            _first_call_extra = None
+
     # Cancel-event lookup — set by the barge-in handler. We reach
     # through ws.state since this function is module-level.
     _cancel_event: Optional[asyncio.Event] = getattr(ws.state, "cancel_event", None)
@@ -1474,6 +1739,7 @@ async def _process_text_query(
                 temperature=cfg.llm.temperature if cfg else 0.7,
                 max_tokens=cfg.llm.max_tokens if cfg else None,
                 tools=_tools_for_call,
+                extra=_first_call_extra,
                 **_tier_kwargs,
             ):
                 if _cancel_event is not None and _cancel_event.is_set():
@@ -1505,6 +1771,12 @@ async def _process_text_query(
         _put_token(SENTINEL)
 
     t_llm_thread_start = time.monotonic()
+    # A real ANTHROPIC call refreshes the prompt cache. tier1 (Cerebras)
+    # turns don't — stamping on those let a string of quick greetings
+    # suppress the keep-warm while the Anthropic cache went cold, so the
+    # next real question paid the full cold-prefix TTFT anyway.
+    if tier in ("tier2", "tier3"):
+        _LLM_WARM_STATE["last_activity"] = t_llm_thread_start
 
     threading.Thread(target=_producer, daemon=True).start()
 
@@ -1779,25 +2051,56 @@ async def _process_text_query(
             # the whole turn: no llm_done, TTS worker never drained).
             tool_name = ""
             tool_args: dict = {}
+            _stream_done_after_tools = False
             try:
-                raw_payload = token[len("__TOOL_CALL__:"):]
-                try:
-                    payload = json.loads(raw_payload)
-                except json.JSONDecodeError as je:
-                    logger.warning(
-                        "[tool_call] malformed sentinel JSON: %s (payload=%r)",
-                        je, raw_payload[:200],
-                    )
-                    raise
-                tc = payload["message"]["tool_calls"][0]["function"]
-                tool_name = tc["name"]
-                tool_args = tc.get("arguments", {})
-                if not isinstance(tool_args, dict):
-                    logger.warning(
-                        "[tool_call] %s got non-dict args (%r) — coercing to {}",
-                        tool_name, tool_args,
-                    )
-                    tool_args = {}
+                # ── Collect ALL tool-call sentinels for this turn ──
+                # The driver emits one sentinel per parallel tool call,
+                # then ends the stream. Previously only the first was
+                # dispatched and the rest were silently swallowed, so
+                # "check my calendar and the weather" ran one tool and
+                # ignored the other. Drain the queue up to stream end
+                # (bounded — the remaining sentinels are already in
+                # flight when the first one arrives).
+                _sentinels = [token]
+                while True:
+                    try:
+                        _nxt = await asyncio.wait_for(
+                            token_queue.get(), timeout=3.0,
+                        )
+                    except asyncio.TimeoutError:
+                        break
+                    if _nxt is SENTINEL:
+                        _stream_done_after_tools = True
+                        break
+                    if isinstance(_nxt, str) and _nxt.startswith("__TOOL_CALL__:"):
+                        _sentinels.append(_nxt)
+                    # Trailing TEXT alongside tool calls is dropped —
+                    # it's usually hallucinated narration; the tool
+                    # result is the real answer.
+
+                _tool_calls_parsed: list[tuple[str, dict]] = []
+                for _s in _sentinels:
+                    try:
+                        payload = json.loads(_s[len("__TOOL_CALL__:"):])
+                        tc = payload["message"]["tool_calls"][0]["function"]
+                        _pname = tc.get("name") or ""
+                        _pargs = tc.get("arguments", {})
+                        if not isinstance(_pargs, dict):
+                            logger.warning(
+                                "[tool_call] %s got non-dict args (%r) — coercing to {}",
+                                _pname, _pargs,
+                            )
+                            _pargs = {}
+                        if _pname:
+                            _tool_calls_parsed.append((_pname, _pargs))
+                    except Exception as je:
+                        logger.warning(
+                            "[tool_call] malformed sentinel: %s (payload=%r)",
+                            je, _s[:200],
+                        )
+                if not _tool_calls_parsed:
+                    raise ValueError("no parsable tool calls in stream")
+                tool_name, tool_args = _tool_calls_parsed[0]
 
                 from mother.llm.tools import ToolContext, dispatch_tool_call
                 from mother.memory.manager import get_user_memory
@@ -1823,38 +2126,75 @@ async def _process_text_query(
                     repl_session_key=id(ws),
                 )
 
-                # execute_python takes a side-channel through the
-                # shared dispatcher so the /exec view gets the
-                # structured SSE event WITHOUT re-running the code.
-                if tool_name == "execute_python":
-                    result = await _dispatch_execute_python(
-                        tool_args, ws=ws, event_bus=event_bus,
-                        turn_state=turn_state, current_user=current_user,
-                    )
-                else:
-                    # Off the event loop — tool handlers do blocking
-                    # network I/O (Brave search, IMAP email, iCloud
-                    # CalDAV). Running them inline froze TTS streaming
-                    # and every other session for the full call.
-                    result = await asyncio.to_thread(
-                        dispatch_tool_call, tool_name, tool_args, ctx,
-                    )
+                # ── Perceived-latency ack ──
+                # Slow tools (web search, IMAP, CalDAV) mean 1-4s of
+                # dead air. Speak a one-word in-character acknowledgment
+                # the moment dispatch starts so the wait feels near-
+                # instant. Spoken only — not added to the transcript or
+                # conversation memory.
+                SLOW_TOOLS = {
+                    "brave_web_search", "research", "fetch_url",
+                    "search_info", "get_news_headlines",
+                    "summarize_inbox", "search_email", "read_email",
+                    "get_calendar_today", "get_calendar_range",
+                    "search_calendar", "get_stock_price",
+                    "look_at_screen", "system_status",
+                }
+                if any(n in SLOW_TOOLS for n, _ in _tool_calls_parsed):
+                    _queue_tts("Working.")
 
-                # Emit a dashboard event for observability. D2 will
-                # consume this via SSE; for now it just goes to the
-                # event bus.
-                _emit_event(event_bus, {
-                    "type": "tool_call",
-                    "name": tool_name,
-                    "args": tool_args,
-                    "result": result[:MAX_RESULT_PREVIEW],
-                })
+                async def _run_one_tool(name: str, args: dict) -> str:
+                    """Dispatch one tool call; never raises. Emits the
+                    per-call WS + SSE observability events. execute_python
+                    goes through the shared dispatcher so the /exec view
+                    gets its structured event without re-running code;
+                    everything else runs off the event loop (tool
+                    handlers do blocking network I/O)."""
+                    try:
+                        if name == "execute_python":
+                            res = await _dispatch_execute_python(
+                                args, ws=ws, event_bus=event_bus,
+                                turn_state=turn_state,
+                                current_user=current_user,
+                            )
+                        else:
+                            res = await asyncio.to_thread(
+                                dispatch_tool_call, name, args, ctx,
+                            )
+                    except Exception as te:
+                        logger.warning("Tool %s dispatch error: %s", name, te)
+                        if name == "execute_python":
+                            _emit_event(event_bus, {
+                                "type": "code_exec",
+                                "code": args.get("code", ""),
+                                "stdout": "",
+                                "stderr": f"Dispatch error: {te}",
+                                "value": "",
+                                "duration_s": 0,
+                                "timed_out": False,
+                                "images": [],
+                                "session": id(ws),
+                            })
+                        res = f"Tool '{name}' failed: {te}"
+                    _emit_event(event_bus, {
+                        "type": "tool_call",
+                        "name": name,
+                        "args": args,
+                        "result": res[:MAX_RESULT_PREVIEW],
+                    })
+                    await _send_event(ws, {
+                        "event": "tool_call",
+                        "name": name,
+                        "result": res,
+                    })
+                    return res
 
-                await _send_event(ws, {
-                    "event": "tool_call",
-                    "name": tool_name,
-                    "result": result,
-                })
+                # Parallel tool calls are independent by definition —
+                # dispatch them all concurrently.
+                _tool_results = await asyncio.gather(
+                    *(_run_one_tool(n, a) for n, a in _tool_calls_parsed)
+                )
+                result = _tool_results[0]
 
                 # Two classes of tool output:
                 #   TERSE: output is already a clean, speakable sentence.
@@ -1891,7 +2231,16 @@ async def _process_text_query(
                     intent.name == "GENERAL"
                     and _is_compound_query(text.lower())
                 )
-                is_terse = (tool_name in TERSE_TOOLS) and not _force_chain
+                # Direct-TTS only for a SINGLE terse call that succeeded
+                # — multiple parallel calls always need the LLM to weave
+                # the results into one answer, and error strings should
+                # be rephrased in character, not spoken raw.
+                is_terse = (
+                    len(_tool_calls_parsed) == 1
+                    and tool_name in TERSE_TOOLS
+                    and not _force_chain
+                    and not result.startswith("Tool '")
+                )
 
                 if is_terse:
                     await _send_event(ws, {"event": "llm_token", "token": result})
@@ -1908,12 +2257,50 @@ async def _process_text_query(
                     # read → search again → synthesize" chains without
                     # shipping awkward intermediate speech.
                     from mother.llm.drivers import ChatMessage as _CM
-                    MAX_REACT_HOPS = 3
+                    # 5 hops lets a hard question run search → read →
+                    # search again → quote → synthesize instead of
+                    # summarizing the first result page. The per-hop
+                    # stall watchdog still bounds worst-case latency,
+                    # and "Working." covers the wait for slow tools.
+                    MAX_REACT_HOPS = 5
                     narration_msgs = list(messages)
-                    narration_msgs.append(_CM(
-                        role="tool",
-                        content=f"{tool_name} result:\n{result}",
-                    ))
+                    # One tool message PER parallel call so the model
+                    # synthesizes all of them into a single answer.
+                    for (_pn, _pa), _pr in zip(_tool_calls_parsed, _tool_results):
+                        narration_msgs.append(_CM(
+                            role="tool",
+                            content=f"{_pn} result:\n{_pr}",
+                        ))
+
+                    # When code ran, its stdout is already rendered in
+                    # the dashboard's exec window. Without this hint the
+                    # model dutifully reads 64-char hashes / long values
+                    # into speech, which is the exact recitation the
+                    # exec view exists to avoid.
+                    _ran_code = any(
+                        _pn == "execute_python" for _pn, _pa in _tool_calls_parsed
+                    )
+                    _code_instr = (
+                        " The code and its full output are already on my "
+                        "screen in the code window — never read long raw "
+                        "values (hashes, IDs, long numbers, tables) aloud. "
+                        "Confirm what ran and point me at the window; at "
+                        "most speak the first few characters."
+                    ) if _ran_code else ""
+                    # Permanent learning from confirmed corrections: if
+                    # the user reported an event and verification bore
+                    # it out against the model's stale prior, store the
+                    # corrected fact (source='corrected', conf 1.0) so
+                    # NEXT session knows it without a search. This is
+                    # how one SpaceX-IPO embarrassment stays one.
+                    if _news_claim_turn:
+                        _code_instr += (
+                            " If the search CONFIRMS the event I reported "
+                            "and it differs from what you believed or said "
+                            "before, also call correct_fact (key=the "
+                            "subject, value=the corrected fact with its "
+                            "date) so you permanently remember it."
+                        )
 
                     final_text = ""
                     hop = 0
@@ -1924,7 +2311,7 @@ async def _process_text_query(
                                 "Answer my question now using everything "
                                 "you've gathered. No more tool calls. "
                                 "One or two short sentences. Your voice."
-                            )
+                            ) + _code_instr
                             tools_this_hop = None
                         else:
                             instr = (
@@ -1933,7 +2320,7 @@ async def _process_text_query(
                                 "need more info — don't pad. When you "
                                 "answer: one or two short sentences, "
                                 "your voice, not raw results."
-                            )
+                            ) + _code_instr
                             tools_this_hop = _tools_for_call
                         narration_msgs.append(_CM(role="user", content=instr))
 
@@ -2075,6 +2462,11 @@ async def _process_text_query(
                     # Stream the final synthesis through TTS with the
                     # same sentence-boundary chunking as the main path.
                     if final_text:
+                        # Hard guarantee, not a prompt hint: when code
+                        # ran, long raw values never reach TTS or the
+                        # transcript — the exec window has the real one.
+                        if _ran_code:
+                            final_text = _redact_long_literals(final_text)
                         full_response.append(final_text)
                         await _send_event(ws, {"event": "llm_token", "token": final_text})
                         narration_buf = final_text
@@ -2152,6 +2544,11 @@ async def _process_text_query(
                         full_response.append(err_msg)
                         await _send_event(ws, {"event": "llm_token", "token": err_msg})
                         _queue_tts(err_msg)
+            if _stream_done_after_tools:
+                # The stream-end sentinel was consumed while collecting
+                # parallel tool calls — leave the drain loop now instead
+                # of waiting out the 30s mid-stream watchdog.
+                break
             continue
 
         # Suppress any trailing text tokens after a tool call. Claude

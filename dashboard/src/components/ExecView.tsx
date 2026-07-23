@@ -103,6 +103,14 @@ export default function ExecView() {
         <button onClick={clear} className="exec-clear">
           clear log
         </button>
+        <a
+          href="/"
+          className="exec-clear"
+          style={{ textDecoration: 'none' }}
+          title="Back to the main dashboard"
+        >
+          ← dashboard
+        </a>
       </header>
       <div ref={scrollRef} className="exec-scroll">
         {cells.length === 0 ? (

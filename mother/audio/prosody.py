@@ -5,7 +5,7 @@ register tag that gets injected into the LLM system prompt.
 Three features, all pure numpy (no extra deps):
   • Loudness  — RMS energy on speech-only frames
   • Pitch     — fundamental-frequency stats via autocorrelation
-  • Rate      — voiced-frame fraction × duration → syllables/sec proxy
+  • Rate      — voiced-frame fraction of speech frames → pace proxy
 
 These are deliberately coarse. The goal is to differentiate "calm
 question" from "urgent shout" from "frustrated sigh" with enough
@@ -146,9 +146,11 @@ def analyze(audio: np.ndarray, sample_rate: int = _SR) -> ProsodyFeatures:
             voiced_fraction=0.0, duration_s=duration_s, confidence=0.0,
         )
 
-    # Normalize to peak ~1.0 so loudness-thresholds are meaningful
-    # regardless of input gain. Preserve the energy-relative dB by
-    # measuring RMS BEFORE normalization.
+    # Normalize to peak ~1.0 for pitch analysis and the silence-floor
+    # speech mask (both gain-independent). Loudness (rms_db) is measured
+    # on the ORIGINAL pre-normalization signal — see below — so the
+    # absolute loud/soft dBFS thresholds reflect real input level, not
+    # peak-relative dynamics.
     peak = float(np.max(np.abs(audio))) or 1.0
     audio_n = (audio / peak).astype(np.float32)
 
@@ -168,8 +170,11 @@ def analyze(audio: np.ndarray, sample_rate: int = _SR) -> ProsodyFeatures:
             voiced_fraction=0.0, duration_s=duration_s, confidence=0.1,
         )
 
-    # Mean loudness over speech frames, in dBFS.
-    mean_rms_speech = float(np.mean(rms_per_frame[speech_mask]))
+    # Mean loudness over speech frames, in dBFS of the ORIGINAL
+    # (pre-normalization) audio. Frames were cut from audio_n = audio /
+    # peak, so multiplying the normalized RMS by `peak` recovers the
+    # original-scale RMS exactly.
+    mean_rms_speech = float(np.mean(rms_per_frame[speech_mask])) * peak
     rms_db = 20.0 * np.log10(mean_rms_speech + 1e-9)
 
     # F0 per frame for the speech frames only — cheaper than running
@@ -308,12 +313,15 @@ def describe(
             if feats.pitch_var > 30.0:
                 tags.append("animated")
 
-    # Cadence: voiced fraction × duration. Fast speakers cram more
-    # voiced frames into less time. Slow speakers leave gaps.
-    voiced_per_sec = feats.voiced_fraction / max(0.3, feats.duration_s)
-    if voiced_per_sec > 0.55:
+    # Cadence: voiced-frame density within speech. voiced_fraction is
+    # already voiced-time-per-second of speech (voiced frames / speech
+    # frames, 0..1, duration-independent): fast speakers voice most
+    # frames with few gaps; slow speakers leave gaps. Use it directly —
+    # dividing by duration would make "fast" unreachable for long
+    # utterances and automatic for short ones.
+    if feats.voiced_fraction > 0.75:
         tags.append("fast")
-    elif feats.duration_s > 1.5 and voiced_per_sec < 0.25:
+    elif feats.duration_s > 1.5 and feats.voiced_fraction < 0.40:
         tags.append("slow")
 
     # Composite register: urgent = loud + fast + (high or animated).

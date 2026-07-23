@@ -120,6 +120,62 @@ class DeepgramConfig:
     smart_format: bool = True
     interim_results: bool = True
     utterance_end_ms: int = 1000
+    # Nova-3 keyterm prompting: names/tickers/jargon the acoustic model
+    # should favor. Misheard proper nouns are the biggest hidden
+    # intelligence killer in a voice assistant — the LLM can't answer
+    # a question it transcribed wrong.
+    keyterms: tuple = ()
+
+
+def _keyterms_from_config() -> tuple:
+    """Boost vocabulary: static list from configs/app.yaml PLUS proper
+    nouns harvested from the user's learned memory facts — so Ultron's
+    hearing improves automatically as he learns names, tickers, and
+    entities, without anyone editing YAML. Best-effort; either source
+    failing costs only its terms."""
+    out: list = []
+    seen = set()
+
+    def _add(term: str) -> None:
+        t = str(term).strip()
+        if t and 2 <= len(t) <= 40 and t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+
+    try:
+        import yaml
+        from pathlib import Path
+        p = Path(__file__).resolve().parents[2] / "configs" / "app.yaml"
+        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        for t in (data.get("stt") or {}).get("keyterms") or []:
+            _add(t)
+    except Exception:
+        pass
+
+    # Dynamic terms: capitalized words / ALL-CAPS tokens (names,
+    # tickers, products) from stored fact values. Common sentence-case
+    # words are filtered by requiring the token to look name-like.
+    try:
+        import re as _re
+        from mother.identity.speaker import get_or_fallback_user
+        from mother.memory.manager import get_user_memory
+        u = get_or_fallback_user()
+        if u is not None:
+            mem = get_user_memory(u.user_id)
+            if mem is not None:
+                _name_re = _re.compile(r"\b([A-Z][a-z]{2,15}|[A-Z]{2,6})\b")
+                _stop = {
+                    "The", "This", "That", "They", "When", "Where",
+                    "What", "With", "From", "Have", "Will", "Yes", "Not",
+                }
+                for meta in mem.get_all_facts().values():
+                    for tok in _name_re.findall(str(meta.get("value", ""))):
+                        if tok not in _stop:
+                            _add(tok)
+    except Exception:
+        pass
+
+    return tuple(out[:50])
 
 
 class StreamingSTT:
@@ -141,13 +197,18 @@ class StreamingSTT:
         deepgram_cfg: Optional[DeepgramConfig] = None,
         whisper_cfg: Optional[FasterWhisperConfig] = None,
     ):
-        self._dg_cfg = deepgram_cfg or DeepgramConfig()
+        if deepgram_cfg is None:
+            deepgram_cfg = DeepgramConfig(keyterms=_keyterms_from_config())
+        self._dg_cfg = deepgram_cfg
         self._wh_cfg = whisper_cfg or FasterWhisperConfig(
             model_size="base.en", device="cpu", compute_type="int8", beam_size=3
         )
         self._whisper: Optional[FasterWhisperSTT] = None
         self._deepgram_available = False
         self._dg_api_key = os.environ.get("DEEPGRAM_API_KEY", "")
+        # Flipped off permanently if a WS handshake fails with keyterms
+        # attached — boosting must never cost us Deepgram entirely.
+        self._keyterms_ok = True
 
     async def init(self):
         """Initialize engines. Call once at startup."""
@@ -311,9 +372,11 @@ class StreamingSTT:
         bool_to_str = lambda b: "true" if b else "false"
 
         def _runner() -> None:
+            handshake_ok = False
+            connect_kwargs: dict = {}
             try:
                 client = DeepgramClient(api_key=self._dg_api_key)
-                with client.listen.v1.connect(
+                connect_kwargs = dict(
                     model=cfg.model,
                     language=cfg.language,
                     encoding=cfg.encoding,
@@ -330,7 +393,13 @@ class StreamingSTT:
                     # speech pauses, early enough that we don't sit
                     # waiting forever after the user stops.
                     endpointing=300,
-                ) as socket:
+                )
+                # Nova-3 keyterm prompting — repeated ?keyterm= params
+                # boost recognition of the configured names/tickers.
+                if cfg.keyterms and self._keyterms_ok:
+                    connect_kwargs["keyterm"] = list(cfg.keyterms)
+                with client.listen.v1.connect(**connect_kwargs) as socket:
+                    handshake_ok = True
                     import threading
                     audio_done = threading.Event()
 
@@ -424,6 +493,22 @@ class StreamingSTT:
                 # We use .result() to enforce ordering: this call won't
                 # return until the put completes on the loop thread.
                 logger.warning("[STT] WS streaming error: %s", e)
+                # Disable keyterms ONLY when the failure actually looks
+                # like parameter rejection (HTTP 4xx / bad request), not
+                # on any pre-handshake death — a DNS blip or transient
+                # 5xx must not permanently degrade proper-noun
+                # recognition for the rest of the process.
+                if not handshake_ok and "keyterm" in connect_kwargs:
+                    _es = str(e).lower()
+                    if any(k in _es for k in (
+                        "400", "bad request", "keyterm", "invalid",
+                        "unprocessable", "422",
+                    )):
+                        self._keyterms_ok = False
+                        logger.warning(
+                            "[STT] keyterm param rejected (%s) — "
+                            "disabling keyterm boosting", e,
+                        )
                 try:
                     asyncio.run_coroutine_threadsafe(
                         result_q.put(("__error__", False, False)), loop,

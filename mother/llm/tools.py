@@ -50,13 +50,19 @@ TOOLS_SCHEMA: List[Dict] = [
         "type": "function",
         "function": {
             "name": "get_stock_price",
-            "description": "Get the current price of a stock or cryptocurrency.",
+            "description": (
+                "Live market quote: price, day change, 52-week range, "
+                "market cap. Use for any stock/crypto/market question so "
+                "opinions are grounded in the actual number, not memory. "
+                "Returns a clear message when the company is private "
+                "(no public stock)."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "symbol": {
                         "type": "string",
-                        "description": "Ticker symbol, e.g. TSLA, BTC, AAPL.",
+                        "description": "Ticker symbol, e.g. TSLA, AAPL, BTC-USD, ^GSPC.",
                     }
                 },
                 "required": ["symbol"],
@@ -325,6 +331,96 @@ TOOLS_SCHEMA: List[Dict] = [
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "The search query."}
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    # ─────────── J2: research ───────────
+    {
+        "type": "function",
+        "function": {
+            "name": "research",
+            "description": (
+                "Deep research in ONE call: web search plus the full "
+                "text of the top result pages. Prefer this over "
+                "brave_web_search for anything that deserves a real "
+                "answer — analysis, verification, current events, "
+                "'what's going on with X' — because snippets alone "
+                "produce shallow takes. Use brave_web_search only for "
+                "quick single-fact lookups."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What to research."},
+                    "max_sources": {
+                        "type": "integer",
+                        "description": "Pages to read in full (1-3, default 2).",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    # ─────────── J3: look_at_screen ───────────
+    {
+        "type": "function",
+        "function": {
+            "name": "look_at_screen",
+            "description": (
+                "See the user's screen. Captures a screenshot of their "
+                "active window (or full screen) and answers a question "
+                "about it. Use whenever the user references what they're "
+                "looking at: 'what am I looking at', 'read this error', "
+                "'summarize this page', 'what does this say'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "What the user wants to know about the screen.",
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["active_window", "full_screen"],
+                        "description": "Capture just the focused window (default) or everything.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    # ─────────── J4: system_status ───────────
+    {
+        "type": "function",
+        "function": {
+            "name": "system_status",
+            "description": (
+                "Your OWN runtime state: process table, service health, "
+                "host CPU/RAM. Use when asked how you're feeling/doing, "
+                "whether something is wrong with you, or why you seem "
+                "slow — answer from real telemetry, not persona filler."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    # ─────────── J5: search_conversations ───────────
+    {
+        "type": "function",
+        "function": {
+            "name": "search_conversations",
+            "description": (
+                "Search the stored conversation transcript. Use for "
+                "'what did we talk about / decide / say about X', "
+                "'when did I mention Y' — answer from the actual "
+                "record, never from a guess."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Keywords to find."},
                 },
                 "required": ["query"],
             },
@@ -686,26 +782,59 @@ def _handle_get_weather(args: Dict, ctx: ToolContext) -> str:
 
 
 def _handle_get_stock_price(args: Dict, ctx: ToolContext) -> str:
+    # yfinance directly — the old path proxied through the RAG
+    # service's yahooquery, which breaks whenever Yahoo changes its
+    # endpoints and returns nothing when the RAG process is down.
+    # fast_info is one HTTP round-trip (~0.5-1s) and gives enough for
+    # a grounded market take: price, day move, 52-week range, cap.
     symbol = (args.get("symbol") or "").upper().strip()
     if not symbol:
         return "No symbol provided."
-    data = {}
-    if ctx.http:
-        try:
-            resp = ctx.http.get(
-                f"{ctx.rag_base}/finance/quote",
-                params={"symbol": symbol},
-                timeout=ctx.rag_timeout,
-            )
-            data = resp.json() if resp.status_code == 200 else {}
-        except Exception:
-            pass
-    price = data.get("regularMarketPrice")
-    if price is None:
-        return f"Price for {symbol} unavailable."
-    curr = data.get("currency") or "USD"
-    name = data.get("shortName") or symbol
-    return f"{name} ({symbol}): {price:.2f} {curr}."
+    # Distinguish "ticker doesn't exist" (a fact the model may state)
+    # from "data source failed" (an outage the model must NOT convert
+    # into 'the company is private' — that's how a network blip becomes
+    # confidently spoken misinformation, possibly persisted via
+    # correct_fact).
+    try:
+        import yfinance as yf
+    except ImportError:
+        return (
+            "Market data library unavailable (yfinance not installed). "
+            "Do NOT conclude anything about the ticker — use research "
+            "or brave_web_search for the price instead."
+        )
+    try:
+        fi = yf.Ticker(symbol).fast_info
+        price = fi.last_price
+        if price is None:
+            raise KeyError("no price data")
+        parts = [f"{symbol}: {price:,.2f} {fi.currency or 'USD'}"]
+        prev = fi.previous_close
+        if prev:
+            chg = (price - prev) / prev * 100
+            parts.append(f"{chg:+.1f}% vs prev close")
+        if fi.year_low and fi.year_high:
+            parts.append(f"52wk range {fi.year_low:,.0f}-{fi.year_high:,.0f}")
+        if fi.market_cap:
+            parts.append(f"market cap {fi.market_cap / 1e9:,.0f}B")
+        return ", ".join(parts) + "."
+    except KeyError:
+        # Yahoo answered but has no such symbol (unknown tickers raise
+        # KeyError from fast_info's missing metadata). THIS is the
+        # not-listed case.
+        return (
+            f"No market data for '{symbol}' — not a listed ticker. The "
+            "company may be private (no public stock exists) or the "
+            "symbol is wrong."
+        )
+    except Exception as e:
+        # Network/rate-limit/API-change — an outage, not a fact about
+        # the company.
+        return (
+            f"Market data source unreachable for '{symbol}' ({type(e).__name__}). "
+            "This says NOTHING about whether the company is listed — do "
+            "not state it is private. Try research or brave_web_search."
+        )
 
 
 def _handle_search_info(args: Dict, ctx: ToolContext) -> str:
@@ -818,6 +947,26 @@ def _handle_brave_web_search(args: Dict, ctx: ToolContext) -> str:
     return brave_web_search(args)
 
 
+def _handle_research(args: Dict, ctx: ToolContext) -> str:
+    from mother.tools.utility_tools import research
+    return research(args)
+
+
+def _handle_look_at_screen(args: Dict, ctx: ToolContext) -> str:
+    from mother.tools.system_tools import look_at_screen
+    return look_at_screen(args)
+
+
+def _handle_system_status(args: Dict, ctx: ToolContext) -> str:
+    from mother.tools.system_tools import system_status
+    return system_status(args)
+
+
+def _handle_search_conversations(args: Dict, ctx: ToolContext) -> str:
+    from mother.tools.system_tools import search_conversations
+    return search_conversations(args, current_user=ctx.current_user)
+
+
 def _handle_search_code(args: Dict, ctx: ToolContext) -> str:
     # Prefer the configured RAG base on ctx when present; the tool's
     # own env-var fallback handles stand-alone dev/test paths.
@@ -902,6 +1051,10 @@ _HANDLERS: Dict[str, Callable[[Dict, ToolContext], str]] = {
     "calculate":          _handle_calculate,
     "convert_units":      _handle_convert_units,
     "brave_web_search":   _handle_brave_web_search,
+    "research":           _handle_research,
+    "look_at_screen":     _handle_look_at_screen,
+    "system_status":      _handle_system_status,
+    "search_conversations": _handle_search_conversations,
     "search_code":        _handle_search_code,
     "list_my_tools":      _handle_list_my_tools,
     "forget_fact":        _handle_forget_fact,

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Iterable, List, Optional
 
@@ -41,6 +43,29 @@ _BRAVE_API_BASE = "https://api.search.brave.com/res/v1/web/search"
 # Reasonable HTTP timeout for every tool. Tool latency eats user-facing
 # latency, so fail fast rather than block.
 _HTTP_TIMEOUT_S = 5.0
+
+
+# ─────────────────────── shared HTTP client ─────────────────────────
+
+# One process-wide httpx.Client so tool calls reuse pooled TCP+TLS
+# connections instead of paying a fresh handshake per request (weather
+# pays it twice per query: geocode + forecast). Handlers run on worker
+# threads; httpx.Client is thread-safe, and the lock only guards the
+# create/recreate window.
+_HTTP_CLIENT_TIMEOUT_S = 10.0
+_http_lock = threading.Lock()
+_http_client: Optional[httpx.Client] = None
+
+
+def _http() -> httpx.Client:
+    """Return the shared HTTP client, creating it lazily on first use
+    and recreating it if it has been closed. Per-request `timeout=`
+    arguments at call sites still override the client default."""
+    global _http_client
+    with _http_lock:
+        if _http_client is None or _http_client.is_closed:
+            _http_client = httpx.Client(timeout=_HTTP_CLIENT_TIMEOUT_S)
+        return _http_client
 
 
 # ─────────────────────── T — current_time ──────────────────────────
@@ -156,7 +181,7 @@ def _geocode_open_meteo(place: str) -> Optional[tuple[float, float, str]]:
     major city the user was almost certainly asking about.
     """
     try:
-        r = httpx.get(
+        r = _http().get(
             "https://geocoding-api.open-meteo.com/v1/search",
             params={"name": place, "count": 5, "language": "en"},
             timeout=_HTTP_TIMEOUT_S,
@@ -203,7 +228,7 @@ def get_forecast(args: dict) -> str:
         lat, lon, display = resolved
 
     try:
-        r = httpx.get(
+        r = _http().get(
             "https://api.open-meteo.com/v1/forecast",
             params={
                 "latitude": lat,
@@ -270,7 +295,7 @@ def _fetch_titles_from_feed(url: str, max_titles: int) -> List[str]:
     "skip this feed and try the next."
     """
     try:
-        r = httpx.get(
+        r = _http().get(
             url,
             timeout=_HTTP_TIMEOUT_S,
             headers={"User-Agent": "Ultron/1.0"},
@@ -319,10 +344,18 @@ def get_news_headlines(args: dict) -> str:
 
     # Pull a small pool from each feed (up to `count` from each, capped
     # so big feeds don't dominate). Skip feeds that fail silently.
+    # Feeds are fetched concurrently: fetching serially means two slow
+    # feeds cost ~2x the per-feed timeout; in parallel the worst case is
+    # a single timeout. `map` preserves feed order, so the round-robin
+    # merge below behaves exactly as before.
     per_feed_cap = max(3, count)
     pools: List[List[str]] = []
-    for url in feeds:
-        titles = _fetch_titles_from_feed(url, per_feed_cap)
+    with ThreadPoolExecutor(max_workers=min(len(feeds), 8)) as executor:
+        fetched = list(executor.map(
+            lambda url: _fetch_titles_from_feed(url, per_feed_cap),
+            feeds,
+        ))
+    for titles in fetched:
         if titles:
             pools.append(titles)
 
@@ -553,7 +586,7 @@ def brave_web_search(args: dict) -> str:
             "Set BRAVE_API_KEY (free at brave.com/search/api)."
         )
     try:
-        r = httpx.get(
+        r = _http().get(
             _BRAVE_API_BASE,
             params={"q": query, "count": 5, "safesearch": "moderate"},
             headers={
@@ -625,7 +658,7 @@ def search_code(args: dict) -> str:
 
     base = os.environ.get("ULTRON_RAG_BASE", "http://127.0.0.1:8123")
     try:
-        r = httpx.get(
+        r = _http().get(
             f"{base}/code-search",
             params={"q": query, "k": k},
             timeout=_HTTP_TIMEOUT_S,
@@ -883,3 +916,103 @@ def fetch_url(args: dict) -> str:
     if title:
         header += f"Title: {title}\n"
     return header + f"\n{text}"
+
+
+# ───────────────────────── research ─────────────────────────────────
+# One-shot deep research. Search snippets alone produce shallow
+# answers, and the search → pick a hit → fetch_url chain costs the LLM
+# 2-3 ReAct hops (and it often settles for snippets instead). This
+# does the whole pipeline server-side in a single tool call: Brave
+# search, fetch the top result pages CONCURRENTLY, return snippets +
+# article text as one bounded digest the model can synthesize from.
+
+def research(args: dict) -> str:
+    """Web search + read the top result pages, in one call.
+
+    Args:
+        query: what to research
+        max_sources (optional): pages to fetch full text from (1-3, default 2)
+    """
+    query = (args.get("query") or "").strip()
+    if not query:
+        return "No query provided."
+    api_key = os.environ.get("BRAVE_API_KEY")
+    if not api_key:
+        return (
+            "Web search is not configured. "
+            "Set BRAVE_API_KEY (free at brave.com/search/api)."
+        )
+    try:
+        max_sources = int(args.get("max_sources", 3))
+    except (TypeError, ValueError):
+        max_sources = 3
+    max_sources = max(1, min(3, max_sources))
+
+    try:
+        r = _http().get(
+            _BRAVE_API_BASE,
+            params={"q": query, "count": 8, "safesearch": "moderate"},
+            headers={
+                "Accept": "application/json",
+                "X-Subscription-Token": api_key,
+            },
+            timeout=_HTTP_TIMEOUT_S,
+        )
+        if r.status_code != 200:
+            return f"Web search returned HTTP {r.status_code}."
+        results = (r.json().get("web") or {}).get("results") or []
+    except Exception as e:
+        return f"Web search failed: {e}"
+    if not results:
+        return f"No web results for {query!r}."
+
+    from html import unescape as _unescape
+    tag_re = re.compile(r"<[^>]+>")
+
+    def _clean(s: str) -> str:
+        return re.sub(r"\s+", " ", _unescape(tag_re.sub("", s or ""))).strip()
+
+    header_lines: List[str] = []
+    urls: List[str] = []
+    for item in results[:6]:
+        title = _clean(item.get("title") or "")
+        desc = _clean(item.get("description") or "")
+        url = (item.get("url") or "").strip()
+        # Brave's "age" ("2 days ago", "June 12, 2026") lets the take
+        # say "as of Friday" — dated claims read as intelligence,
+        # undated ones as guesses.
+        age = _clean(item.get("age") or "")
+        if not title:
+            continue
+        if len(desc) > 140:
+            desc = desc[:140].rstrip() + "…"
+        stamp = f" [{age}]" if age else ""
+        header_lines.append(f"{len(header_lines) + 1}. {title}{stamp}: {desc}")
+        if url:
+            urls.append(url)
+
+    # Full text from the top pages, fetched concurrently. fetch_url
+    # brings its own SSRF guard, timeout, and text extraction.
+    articles: List[str] = []
+    if urls:
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _read(u: str) -> tuple:
+            try:
+                return u, fetch_url({"url": u, "max_chars": 2500})
+            except Exception as e:
+                return u, f"Fetch failed: {e}"
+
+        with ThreadPoolExecutor(max_workers=max_sources) as pool:
+            for u, txt in pool.map(_read, urls[:max_sources]):
+                if txt and not txt.startswith(
+                    ("Fetch", "Refusing", "Unsupported", "Page fetched but")
+                ):
+                    articles.append(txt)
+
+    out = f"Research digest for {query!r}:\n" + "\n".join(header_lines)
+    if articles:
+        out += "\n\n=== SOURCE TEXT ===\n\n" + "\n\n---\n\n".join(articles)
+    # Bounded so one digest can't blow out the context or the next
+    # narration hop's budget.
+    return out[:9000]

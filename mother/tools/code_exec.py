@@ -285,6 +285,22 @@ class PersistentRepl:
             raise RuntimeError(f"REPL subprocess bad handshake: {line!r}")
         logger.info("[code_exec] REPL ready (cwd=%s)", self._scratch)
 
+    def warmup(self) -> None:
+        """Start the subprocess if it isn't running, and pre-import the
+        heavy data stack. Called from the WS connect path (off the
+        loop) so the first execute_python of a session pays neither
+        spawn + interpreter boot (~300-800ms) nor the numpy/pandas/
+        matplotlib import tax (~1-3s) on the hot path. np/pd land in
+        the namespace under their conventional aliases — models write
+        `pd.read_csv` unprompted anyway."""
+        self.execute(
+            "import numpy as np\n"
+            "import pandas as pd\n"
+            "import matplotlib\n"
+            "matplotlib.use('Agg')\n",
+            timeout_s=20.0,
+        )
+
     def execute(self, code: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> Dict:
         """Run code, return {stdout, stderr, result, duration_s, timed_out}.
 
